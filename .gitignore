@@ -1,0 +1,20 @@
+# clasp
+.clasp.json
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
