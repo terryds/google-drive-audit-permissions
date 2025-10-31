@@ -1,6 +1,16 @@
-# Google Drive Audit - Open Source
+# Google Drive Audit
 
-An open-source Google Sheets tool that audits Google Drive files and their permissions with scheduled automatic updates.
+Apps Script that audits Google Drive files and their permissions. Supports on-demand audit and automated weekly audit.
+
+## Google Sheets Template
+
+You can make a copy of the [Google Sheets template (Apps Script) attached here](https://docs.google.com/spreadsheets/d/1VI-VmzdH_SsbTEF5CN9dao0L84u56LqJFI3RshIotqg/copy)
+
+
+## Tutorial
+
+Tutorial is published on [my blog.terrydjony.com](https://blog.terrydjony.com/google-drive-audit-access-permissions/)
+
 
 ## Features
 
@@ -189,116 +199,6 @@ This script requires the following permissions:
 - The tool only shows files you have access to
 - Files in shared drives require the `supportsAllDrives` parameter (already included)
 
-## Customization
-
-### Change Audit Schedule Time or Day
-Edit the `setupWeeklyTrigger()` function in `Code.js`:
-
-**Change the day of week:**
-```javascript
-ScriptApp.newTrigger('runDriveAudit')
-  .timeBased()
-  .onWeekDay(ScriptApp.WeekDay.MONDAY)  // Change to TUESDAY, WEDNESDAY, etc.
-  .atHour(6)
-  .create();
-```
-
-**Change the time:**
-```javascript
-ScriptApp.newTrigger('runDriveAudit')
-  .timeBased()
-  .onWeekDay(ScriptApp.WeekDay.MONDAY)
-  .atHour(6)  // Change this to your preferred hour (0-23)
-  .create();
-```
-
-**For daily audits instead of weekly:**
-```javascript
-ScriptApp.newTrigger('runDriveAudit')
-  .timeBased()
-  .atHour(6)
-  .everyDays(1)  // Run every day
-  .create();
-```
-
-### Filter Specific File Types
-Modify the `getAllDriveFiles()` function to add a query filter:
-```javascript
-const response = Drive.Files.list({
-  pageSize: 100,
-  q: "mimeType='application/vnd.google-apps.spreadsheet'",  // Add this line
-  fields: 'nextPageToken, files(...)',
-  ...
-});
-```
-
-### Audit Shared Drives Only
-Add to the query in `getAllDriveFiles()`:
-```javascript
-q: "('sharedDriveId' in parents)",
-```
-
 ## License
 
 MIT License - feel free to modify and use as needed.
-
-## Support
-
-For issues or questions:
-1. Check the Apps Script execution logs: `clasp logs`
-2. Review the spreadsheet's execution transcript
-3. Ensure all OAuth scopes are authorized
-4. Open an issue on the GitHub repository
-
-## How It Handles Large Drive Accounts
-
-The tool uses an intelligent batch processing system to handle Drive accounts of any size:
-
-1. **Time Monitoring**: Tracks execution time and stops at 4.5 minutes (safely before the 6-minute limit)
-2. **State Persistence**: Saves progress using PropertiesService
-3. **Auto-Continuation**: Automatically creates a trigger to resume after 1 minute
-4. **Incremental Writing**: Writes audit data to the sheet as it processes, so no data is lost
-5. **Smart Recovery**: Even if interrupted, the audit can resume from where it left off
-
-### Fast Processing
-
-This open-source version uses **1-minute continuation intervals** for fast processing:
-- The audit processes ~500 files per batch (4.5 minutes)
-- Continuation happens automatically every minute
-- Large Drive accounts complete much faster than published add-ons
-- You can audit Drive accounts with 50,000+ files without any manual intervention!
-
-### Estimated Completion Times
-
-Here's what to expect based on your Drive size:
-
-| Files in Drive | Processing Time |
-|---------------|-----------------|
-| 0-500         | ~5 minutes      |
-| 500-1,000     | ~5 minutes      |
-| 1,000-5,000   | ~30 minutes     |
-| 5,000-10,000  | ~60 minutes     |
-| 10,000-20,000 | ~2 hours        |
-| 50,000+       | ~5 hours        |
-
-**Note:** These are approximate. Actual time depends on:
-- Number of permissions per file
-- Network latency
-- API response times
-
-## Version History
-
-- **2.0.0** - Open Source Release
-  - Changed to 1-minute continuation intervals (default)
-  - Removed premium/paid features
-  - Optimized for personal and organizational use
-  - Updated documentation for open-source distribution
-  
-- **1.0.0** - Initial release
-  - Basic file and permission auditing
-  - Scheduled trigger support
-  - Summary dashboard
-  - Batch processing with automatic continuation
-  - Real-time status tracking
-  - Timeout protection
-
