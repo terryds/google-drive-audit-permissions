@@ -4,7 +4,7 @@ Apps Script that audits Google Drive files and their permissions. Supports on-de
 
 ## Google Sheets Template
 
-You can make a copy of the [Google Sheets template (Apps Script) attached here](https://docs.google.com/spreadsheets/d/1VI-VmzdH_SsbTEF5CN9dao0L84u56LqJFI3RshIotqg/copy)
+You can make a copy of the [Google Sheets template (Apps Script) link will be sent after downloading here](https://terrydjony.lemonsqueezy.com/buy/119a2350-1b18-4a16-9d13-ab023ce55830)
 
 
 ## Tutorial
