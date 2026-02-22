@@ -25,6 +25,8 @@ function onOpen(e) {
     .addItem('Setup Weekly Schedule', 'showScheduleDialog')
     .addItem('Remove Schedule', 'removeScheduledAudits')
     .addSeparator()
+    .addItem('Tutorial', 'showTutorial')
+    .addItem('Support the Creator', 'showSupportCreator')
     .addItem('About', 'showAbout')
     .addToUi();
 }
@@ -843,6 +845,36 @@ function showAuditStatus() {
   }
 }
 
+
+/**
+ * Shows the tutorial link
+ */
+function showTutorial() {
+  const ui = SpreadsheetApp.getUi();
+  ui.alert(
+    'Tutorial',
+    'To learn how to use Drive Audit, visit the getting started guide:\n\n' +
+    'https://driveauditr.com/docs/getting-started/\n\n' +
+    'Copy and paste the link above into your browser.',
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * Shows support/donation information
+ */
+function showSupportCreator() {
+  const ui = SpreadsheetApp.getUi();
+  ui.alert(
+    'Support the Creator',
+    'If you find Drive Audit helpful, please consider supporting the creator ' +
+    'Terry Djony via Ko-fi so I can keep maintaining this script!\n\n' +
+    'https://ko-fi.com/terrydjony\n\n' +
+    'Copy and paste the link above into your browser.\n\n' +
+    'Thank you for your support!',
+    ui.ButtonSet.OK
+  );
+}
 
 /**
  * Shows information about the add-on
