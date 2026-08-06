@@ -16,9 +16,12 @@
  * Creates a custom menu in Google Sheets when the script is opened.
  */
 function onOpen(e) {
-  SpreadsheetApp.getUi()
-    .createMenu('Drive Audit')
-    .addItem('Run Audit Now', 'runDriveAudit')
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Drive Audit')
+    .addSubMenu(ui.createMenu('Run Audit Now')
+      .addItem('All Drives (including shared)', 'runDriveAuditAll')
+      .addItem('My Drive only (skip shared drives)', 'runDriveAuditMyDrive')
+      .addItem('Only files I own', 'runDriveAuditOwned'))
     .addItem('Check Audit Status', 'showAuditStatus')
     .addItem('Cancel Running Audit', 'cancelRunningAudit')
     .addSeparator()
@@ -26,7 +29,7 @@ function onOpen(e) {
     .addItem('Remove Schedule', 'removeScheduledAudits')
     .addSeparator()
     .addItem('Tutorial', 'showTutorial')
-    .addItem('Support the Creator', 'showSupportCreator')
+    // .addItem('Support the Creator', 'showSupportCreator')
     .addItem('About', 'showAbout')
     .addToUi();
 }
@@ -100,15 +103,35 @@ function updateAuditStatus(status, message, filesProcessed, totalFiles) {
 }
 
 /**
+ * Menu wrappers that start an audit with a specific scope.
+ * - 'all'     : every file you can access, including shared/organizational drives (original behavior)
+ * - 'myDrive' : only files in your My Drive (skips shared/organizational drives)
+ * - 'owned'   : only files you own
+ */
+function runDriveAuditAll() { runDriveAudit('all'); }
+function runDriveAuditMyDrive() { runDriveAudit('myDrive'); }
+function runDriveAuditOwned() { runDriveAudit('owned'); }
+
+/**
  * Main function to audit Google Drive files and permissions
  * This version handles timeouts by processing in batches
+ *
+ * @param {string} scope - 'all' | 'myDrive' | 'owned'. Defaults to 'all'
+ *   (e.g. when invoked by the scheduled weekly trigger).
  */
-function runDriveAudit() {
-  // Clear any previous audit state
-  PropertiesService.getScriptProperties().deleteProperty('AUDIT_STATE');
-  PropertiesService.getScriptProperties().deleteProperty('AUDIT_PAGE_TOKEN');
-  
+function runDriveAudit(scope) {
+  if (scope !== 'myDrive' && scope !== 'owned') {
+    scope = 'all';
+  }
+
+  // Clear any previous audit state and record the requested scope
+  const scriptProps = PropertiesService.getScriptProperties();
+  scriptProps.deleteProperty('AUDIT_STATE');
+  scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
+  scriptProps.setProperty('AUDIT_SCOPE', scope);
+
   Logger.log('=== DRIVE AUDIT STARTED (FRESH) ===');
+  Logger.log('Scope: ' + scope);
   Logger.log('Start time: ' + new Date().toISOString());
   
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -120,7 +143,11 @@ function runDriveAudit() {
     0, 0);
   
   // Show progress message
-  ui.alert('Drive Audit', 
+  const scopeLabel = scope === 'myDrive'
+    ? 'My Drive only (shared drives skipped)'
+    : (scope === 'owned' ? 'Only files you own' : 'All Drives (including shared)');
+  ui.alert('Drive Audit',
+    'Scope: ' + scopeLabel + '\n\n' +
     'Starting audit... This may take several minutes depending on the number of files.\n\n' +
     '⏳ The audit will run in the background.\n' +
     '📊 Check the "Audit Status" sheet for progress.\n' +
@@ -158,12 +185,14 @@ function processDriveAuditBatch() {
       Logger.log('First run - initializing audit');
       auditState = {
         phase: 'SETUP',
+        scope: scriptProps.getProperty('AUDIT_SCOPE') || 'all',
         totalFilesFound: 0,
         filesProcessed: 0,
         auditDataCount: 0,
         pageToken: null,
         startTime: new Date().toISOString()
       };
+      Logger.log('Audit scope: ' + auditState.scope);
     } else {
       auditState = JSON.parse(auditState);
       Logger.log('Continuing audit from phase: ' + auditState.phase);
@@ -187,6 +216,7 @@ function processDriveAuditBatch() {
       Logger.log('Setting up headers...');
       const headers = [
         'File Name',
+        'Folder Path',
         'File ID',
         'Owner',
         'Type',
@@ -228,6 +258,10 @@ function processDriveAuditBatch() {
       const BATCH_SIZE = 500; // Process up to 500 files at a time (or until time limit)
       let filesInThisBatch = 0;
       let continueProcessing = true;
+
+      // Cache of folder id -> folder resource, to avoid re-fetching the same
+      // ancestor folders when resolving full folder paths within this run.
+      const folderCache = {};
       
       while (continueProcessing && filesInThisBatch < BATCH_SIZE) {
         // Check execution time
@@ -240,7 +274,7 @@ function processDriveAuditBatch() {
         }
         
         // Get next batch of files
-        const filesBatch = getDriveFilesBatch(auditState.pageToken, 100);
+        const filesBatch = getDriveFilesBatch(auditState.pageToken, 100, auditState.scope);
         
         if (!filesBatch || !filesBatch.files || filesBatch.files.length === 0) {
           Logger.log('No more files to process');
@@ -257,10 +291,12 @@ function processDriveAuditBatch() {
           filesInThisBatch++;
           
           const permissions = getFilePermissions(file.id);
-          
+          const folderPath = getFolderPath(file.parents, folderCache);
+
           if (permissions.length === 0) {
             auditData.push([
               file.name,
+              folderPath,
               file.id,
               file.owners && file.owners.length > 0 ? file.owners[0].emailAddress : 'Unknown',
               getFileType(file),
@@ -280,6 +316,7 @@ function processDriveAuditBatch() {
             permissions.forEach(function(permission) {
               auditData.push([
                 file.name,
+                folderPath,
                 file.id,
                 file.owners && file.owners.length > 0 ? file.owners[0].emailAddress : 'Unknown',
                 getFileType(file),
@@ -302,7 +339,7 @@ function processDriveAuditBatch() {
         // Write data to sheet
         if (auditData.length > 0) {
           const lastRow = auditSheet.getLastRow();
-          auditSheet.getRange(lastRow + 1, 1, auditData.length, 15).setValues(auditData);
+          auditSheet.getRange(lastRow + 1, 1, auditData.length, 16).setValues(auditData);
           auditState.auditDataCount += auditData.length;
           Logger.log('Wrote ' + auditData.length + ' rows. Total rows: ' + auditState.auditDataCount);
         }
@@ -347,12 +384,12 @@ function processDriveAuditBatch() {
       
       if (lastRow > 1) {
         Logger.log('Auto-resizing columns...');
-        for (let i = 1; i <= 15; i++) {
+        for (let i = 1; i <= 16; i++) {
           auditSheet.autoResizeColumn(i);
         }
-        
+
         Logger.log('Adding filter...');
-        auditSheet.getRange(1, 1, lastRow, 15).createFilter();
+        auditSheet.getRange(1, 1, lastRow, 16).createFilter();
       }
       
       // Create summary
@@ -386,7 +423,8 @@ function processDriveAuditBatch() {
       // Clear audit state
       scriptProps.deleteProperty('AUDIT_STATE');
       scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
-      
+      scriptProps.deleteProperty('AUDIT_SCOPE');
+
       // Delete continuation triggers
       deleteContinuationTriggers();
       
@@ -404,6 +442,7 @@ function processDriveAuditBatch() {
     // Clear state on error
     scriptProps.deleteProperty('AUDIT_STATE');
     scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
+    scriptProps.deleteProperty('AUDIT_SCOPE');
     deleteContinuationTriggers();
   }
 }
@@ -452,27 +491,96 @@ function deleteContinuationTriggers() {
 
 /**
  * Gets a batch of files from Google Drive
+ *
+ * @param {string} pageToken - Drive API page token (null for first page)
+ * @param {number} pageSize  - files per page
+ * @param {string} scope     - 'all' | 'myDrive' | 'owned'
  */
-function getDriveFilesBatch(pageToken, pageSize) {
-  Logger.log('Fetching batch of files. PageToken: ' + (pageToken || 'null'));
-  
+function getDriveFilesBatch(pageToken, pageSize, scope) {
+  scope = scope || 'all';
+  Logger.log('Fetching batch of files. Scope: ' + scope + ', PageToken: ' + (pageToken || 'null'));
+
   try {
-    const response = Drive.Files.list({
+    const params = {
       pageSize: pageSize || 100,
-      fields: 'nextPageToken, files(id, name, mimeType, owners, createdTime, modifiedTime, size, webViewLink, permissions)',
-      pageToken: pageToken,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true
-    });
-    
+      fields: 'nextPageToken, files(id, name, mimeType, owners, createdTime, modifiedTime, size, webViewLink, permissions, parents)',
+      pageToken: pageToken
+    };
+
+    if (scope === 'all') {
+      // Original behavior: include shared/organizational drives
+      params.supportsAllDrives = true;
+      params.includeItemsFromAllDrives = true;
+    } else {
+      // 'myDrive' and 'owned': restrict to the user's own corpus, no shared drives
+      params.corpora = 'user';
+      params.supportsAllDrives = false;
+      params.includeItemsFromAllDrives = false;
+      if (scope === 'owned') {
+        params.q = "'me' in owners";
+      }
+    }
+
+    const response = Drive.Files.list(params);
+
     Logger.log('Retrieved ' + (response.files ? response.files.length : 0) + ' files');
     return response;
-    
+
   } catch (error) {
     Logger.log('ERROR fetching files batch: ' + error.toString());
     Logger.log('Stack trace: ' + error.stack);
     return null;
   }
+}
+
+/**
+ * Resolves the full folder path for a file from its parent id(s),
+ * e.g. "My Drive/Projects/2026/Reports".
+ *
+ * Walks up the parent chain, caching each folder lookup in folderCache
+ * (keyed by folder id) so repeated ancestors aren't re-fetched. Returns
+ * an empty string for files with no parent (e.g. items shared with you
+ * that don't live in a folder you can traverse).
+ *
+ * @param {string[]} parents     - file.parents from the Drive API
+ * @param {Object}   folderCache - id -> folder resource (or null) cache
+ */
+function getFolderPath(parents, folderCache) {
+  if (!parents || parents.length === 0) {
+    return '';
+  }
+
+  const pathParts = [];
+  let currentId = parents[0]; // a file is normally in a single folder
+  let depth = 0;
+  const MAX_DEPTH = 100; // safety guard against unexpected cycles
+
+  while (currentId && depth < MAX_DEPTH) {
+    depth++;
+
+    let folder = folderCache[currentId];
+    if (folder === undefined) {
+      try {
+        folder = Drive.Files.get(currentId, {
+          fields: 'id, name, parents',
+          supportsAllDrives: true
+        });
+      } catch (error) {
+        Logger.log('WARNING: could not resolve folder ' + currentId + ': ' + error.toString());
+        folder = null;
+      }
+      folderCache[currentId] = folder;
+    }
+
+    if (!folder) {
+      break;
+    }
+
+    pathParts.unshift(folder.name);
+    currentId = (folder.parents && folder.parents.length > 0) ? folder.parents[0] : null;
+  }
+
+  return pathParts.join('/');
 }
 
 /**
@@ -492,12 +600,12 @@ function getAllDriveFiles() {
       
       const response = Drive.Files.list({
         pageSize: 100,
-        fields: 'nextPageToken, files(id, name, mimeType, owners, createdTime, modifiedTime, size, webViewLink, permissions)',
+        fields: 'nextPageToken, files(id, name, mimeType, owners, createdTime, modifiedTime, size, webViewLink, permissions, parents)',
         pageToken: pageToken,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true
       });
-      
+
       if (response.files && response.files.length > 0) {
         files.push(...response.files);
         Logger.log('Page ' + pageNumber + ' retrieved: ' + response.files.length + ' files (Total so far: ' + files.length + ')');
@@ -766,7 +874,8 @@ function cancelRunningAudit() {
       // Delete audit state
       scriptProps.deleteProperty('AUDIT_STATE');
       scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
-      
+      scriptProps.deleteProperty('AUDIT_SCOPE');
+
       // Delete continuation triggers
       deleteContinuationTriggers();
       Logger.log('Deleted continuation triggers');
@@ -863,18 +972,18 @@ function showTutorial() {
 /**
  * Shows support/donation information
  */
-function showSupportCreator() {
-  const ui = SpreadsheetApp.getUi();
-  ui.alert(
-    'Support the Creator',
-    'If you find Drive Audit helpful, please consider supporting the creator ' +
-    'Terry Djony via Ko-fi so I can keep maintaining this script!\n\n' +
-    'https://ko-fi.com/terrydjony\n\n' +
-    'Copy and paste the link above into your browser.\n\n' +
-    'Thank you for your support!',
-    ui.ButtonSet.OK
-  );
-}
+// function showSupportCreator() {
+//   const ui = SpreadsheetApp.getUi();
+//   ui.alert(
+//     'Support the Creator',
+//     'If you find Drive Audit helpful, please consider supporting the creator ' +
+//     'Terry Djony via Ko-fi so I can keep maintaining this script!\n\n' +
+//     'https://ko-fi.com/terrydjony\n\n' +
+//     'Copy and paste the link above into your browser.\n\n' +
+//     'Thank you for your support!',
+//     ui.ButtonSet.OK
+//   );
+// }
 
 /**
  * Shows information about the add-on
