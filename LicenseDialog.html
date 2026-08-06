@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body {
+        font-family: 'Google Sans', Roboto, Arial, sans-serif;
+        font-size: 14px;
+        color: #202124;
+        margin: 0;
+        padding: 16px 20px 20px;
+      }
+      .context {
+        background: #fef7e0;
+        border: 1px solid #f9cc79;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 14px;
+        line-height: 1.4;
+      }
+      .benefits-title {
+        font-weight: 600;
+        margin: 0 0 6px;
+      }
+      ul {
+        margin: 0 0 16px;
+        padding-left: 22px;
+        line-height: 1.6;
+      }
+      .buy-btn {
+        display: block;
+        text-align: center;
+        background: #1a73e8;
+        color: #ffffff;
+        padding: 10px 16px;
+        border-radius: 6px;
+        text-decoration: none;
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .buy-btn:hover { background: #1765cc; }
+      .divider {
+        display: flex;
+        align-items: center;
+        color: #5f6368;
+        font-size: 12px;
+        margin: 18px 0 10px;
+      }
+      .divider::before, .divider::after {
+        content: '';
+        flex: 1;
+        border-top: 1px solid #dadce0;
+      }
+      .divider::before { margin-right: 10px; }
+      .divider::after { margin-left: 10px; }
+      .row { display: flex; gap: 8px; }
+      #code {
+        flex: 1;
+        padding: 8px 10px;
+        border: 1px solid #dadce0;
+        border-radius: 6px;
+        font-size: 13px;
+        font-family: monospace;
+      }
+      #code:focus { outline: none; border-color: #1a73e8; }
+      #activate {
+        padding: 8px 16px;
+        background: #ffffff;
+        color: #1a73e8;
+        border: 1px solid #dadce0;
+        border-radius: 6px;
+        font-weight: 600;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #activate:hover { background: #f8f9fa; }
+      #activate:disabled { color: #9aa0a6; cursor: default; }
+      #status {
+        margin-top: 10px;
+        min-height: 18px;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+      #status.error { color: #c5221f; }
+      #status.success { color: #188038; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <? if (message) { ?>
+      <div class="context"><?= message ?></div>
+    <? } ?>
+
+    <p class="benefits-title">A license unlocks:</p>
+    <ul>
+      <li>Unlimited audits (free version: <?= freeLimit ?> total)</li>
+      <li>Weekly scheduled audits</li>
+      <li>Prioritized customer support &mdash;
+        <a href="mailto:<?= supportEmail ?>"><?= supportEmail ?></a>
+        (reply within 1&ndash;2 business days max)</li>
+    </ul>
+
+    <a class="buy-btn" href="<?= checkoutUrl ?>" target="_blank" rel="noopener">🛒 Get a License</a>
+
+    <div class="divider">Already have a code?</div>
+
+    <div class="row">
+      <input id="code" type="text" placeholder="Paste your license code" autocomplete="off">
+      <button id="activate" onclick="activate()">Activate</button>
+    </div>
+    <div id="status"></div>
+
+    <script>
+      var NEXT_ACTION = '<?= nextAction ?>';
+
+      var codeInput = document.getElementById('code');
+      var activateBtn = document.getElementById('activate');
+      var statusEl = document.getElementById('status');
+
+      codeInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') activate();
+      });
+
+      function setStatus(text, cls) {
+        statusEl.textContent = text;
+        statusEl.className = cls || '';
+      }
+
+      function activate() {
+        var code = codeInput.value.trim();
+        if (!code) {
+          setStatus('Please enter a license code.', 'error');
+          return;
+        }
+        activateBtn.disabled = true;
+        setStatus('Checking your code...', '');
+        google.script.run
+          .withSuccessHandler(onResult)
+          .withFailureHandler(onError)
+          .activateLicenseWithCode(code);
+      }
+
+      function onResult(res) {
+        if (res && res.success) {
+          codeInput.disabled = true;
+          if (NEXT_ACTION === 'schedule') {
+            setStatus('✅ License activated! Opening schedule setup...', 'success');
+            google.script.run.continueAfterActivation(NEXT_ACTION);
+            setTimeout(function () { google.script.host.close(); }, 1200);
+          } else if (NEXT_ACTION.indexOf('audit:') === 0) {
+            setStatus('✅ License activated! Starting your audit...', 'success');
+            google.script.run.continueAfterActivation(NEXT_ACTION);
+            setTimeout(function () { google.script.host.close(); }, 1200);
+          } else {
+            setStatus('✅ License activated! You\'re all set — enjoy unlimited audits.', 'success');
+            activateBtn.textContent = 'Close';
+            activateBtn.disabled = false;
+            activateBtn.onclick = function () { google.script.host.close(); };
+          }
+        } else {
+          activateBtn.disabled = false;
+          setStatus((res && res.message) || 'Something went wrong. Please try again.', 'error');
+        }
+      }
+
+      function onError(err) {
+        activateBtn.disabled = false;
+        setStatus('Error: ' + (err && err.message ? err.message : err), 'error');
+      }
+    </script>
+  </body>
+</html>

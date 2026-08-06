@@ -12,11 +12,130 @@
  * - Scheduled weekly audits
  */
 
+// ============ LICENSING ============
+
+const LICENSE_CHECKOUT_URL = 'https://terrydjony.lemonsqueezy.com/checkout/buy/07b31196-a486-47a7-a527-df65ce09ea8d';
+const FREE_AUDIT_LIMIT = 2;
+const SUPPORT_EMAIL = 'driveauditr@terrydjony.com';
+
+const LICENSE_BENEFITS =
+  '• Unlimited audits (free version: ' + FREE_AUDIT_LIMIT + ' total)\n' +
+  '• Weekly scheduled audits\n' +
+  '• Prioritized customer support: ' + SUPPORT_EMAIL + '\n' +
+  '  (reply within 1-2 business days max)';
+
+/**
+ * Verifies a license code.
+ * Basic check for now; will be replaced with a proper license API later.
+ */
+function isValidLicenseCode(code) {
+  return code === 'f71e606bf83512828fc58fa35db31c15';
+}
+
+/**
+ * Whether the current user has activated a valid license.
+ */
+function isLicensed() {
+  const code = PropertiesService.getUserProperties().getProperty('LICENSE_CODE');
+  return !!code && isValidLicenseCode(code);
+}
+
+/**
+ * How many free audits the current user has run.
+ */
+function getFreeAuditsUsed() {
+  return parseInt(PropertiesService.getUserProperties().getProperty('FREE_AUDITS_USED') || '0', 10);
+}
+
+/**
+ * Menu entry point: opens the license dialog (or shows status if already active).
+ */
+function activateLicense() {
+  if (isLicensed()) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert('License Active',
+      '✅ Your license is already active. Thank you for your support!\n\n' +
+      'You have access to:\n' + LICENSE_BENEFITS,
+      ui.ButtonSet.OK);
+    return;
+  }
+  showLicenseDialog('', 'none');
+}
+
+/**
+ * Opens the license HTML dialog (clickable checkout link + code entry).
+ *
+ * @param {string} message    - contextual banner explaining why the dialog
+ *                              appeared ('' for none)
+ * @param {string} nextAction - what to do after successful activation:
+ *                              'none' | 'schedule' | 'audit:<scope>'
+ */
+function showLicenseDialog(message, nextAction) {
+  const template = HtmlService.createTemplateFromFile('LicenseDialog');
+  template.message = message || '';
+  template.nextAction = nextAction || 'none';
+  template.checkoutUrl = LICENSE_CHECKOUT_URL;
+  template.freeLimit = FREE_AUDIT_LIMIT;
+  template.supportEmail = SUPPORT_EMAIL;
+
+  SpreadsheetApp.getUi().showModalDialog(
+    template.evaluate().setWidth(420).setHeight(400),
+    'Drive Audit License');
+}
+
+/**
+ * Called from the license dialog (google.script.run) to validate and
+ * store a license code for the current user.
+ */
+function activateLicenseWithCode(code) {
+  code = (code || '').trim();
+
+  if (!isValidLicenseCode(code)) {
+    return {
+      success: false,
+      message: '❌ That code doesn\'t look right. Check the code in your ' +
+               'purchase receipt email and make sure it was copied completely.'
+    };
+  }
+
+  PropertiesService.getUserProperties().setProperty('LICENSE_CODE', code);
+  Logger.log('License activated');
+  return { success: true };
+}
+
+/**
+ * Called from the license dialog after a successful activation to
+ * resume whatever the user was trying to do when they hit the paywall.
+ */
+function continueAfterActivation(nextAction) {
+  if (!isLicensed()) {
+    return; // safety: never resume gated actions without a license
+  }
+
+  if (nextAction === 'schedule') {
+    showScheduleConfirm();
+  } else if (nextAction && nextAction.indexOf('audit:') === 0) {
+    runDriveAudit(nextAction.split(':')[1]);
+  }
+}
+
 /**
  * Creates a custom menu in Google Sheets when the script is opened.
  */
 function onOpen(e) {
   const ui = SpreadsheetApp.getUi();
+
+  // Label the license menu item by state. UserProperties may not be
+  // accessible in limited auth modes, so fall back to the default label.
+  let licenseLabel = '🔑 Activate License Code';
+  try {
+    if (isLicensed()) {
+      licenseLabel = '✅ License: Active';
+    }
+  } catch (err) {
+    Logger.log('Could not read license state in onOpen: ' + err.toString());
+  }
+
   ui.createMenu('Drive Audit')
     .addSubMenu(ui.createMenu('Run Audit Now')
       .addItem('All Drives (including shared)', 'runDriveAuditAll')
@@ -27,6 +146,8 @@ function onOpen(e) {
     .addSeparator()
     .addItem('Setup Weekly Schedule', 'showScheduleDialog')
     .addItem('Remove Schedule', 'removeScheduledAudits')
+    .addSeparator()
+    .addItem(licenseLabel, 'activateLicense')
     .addSeparator()
     .addItem('Tutorial', 'showTutorial')
     // .addItem('Support the Creator', 'showSupportCreator')
@@ -108,9 +229,51 @@ function updateAuditStatus(status, message, filesProcessed, totalFiles) {
  * - 'myDrive' : only files in your My Drive (skips shared/organizational drives)
  * - 'owned'   : only files you own
  */
-function runDriveAuditAll() { runDriveAudit('all'); }
-function runDriveAuditMyDrive() { runDriveAudit('myDrive'); }
-function runDriveAuditOwned() { runDriveAudit('owned'); }
+function runDriveAuditAll() { startAuditFromMenu('all'); }
+function runDriveAuditMyDrive() { startAuditFromMenu('myDrive'); }
+function runDriveAuditOwned() { startAuditFromMenu('owned'); }
+
+/**
+ * License gate for audits started from the menu.
+ * Licensed users run unlimited audits; free users get FREE_AUDIT_LIMIT total,
+ * tracked per user in UserProperties. Scheduled triggers call runDriveAudit
+ * directly and are not counted (the schedule itself requires a license).
+ */
+function startAuditFromMenu(scope) {
+  if (isLicensed()) {
+    runDriveAudit(scope);
+    return;
+  }
+
+  const used = getFreeAuditsUsed();
+
+  if (used >= FREE_AUDIT_LIMIT) {
+    // Free audits exhausted. If they activate a license in the dialog,
+    // the audit they asked for starts automatically.
+    showLicenseDialog(
+      '🔒 You\'ve used your ' + FREE_AUDIT_LIMIT + ' free audits. ' +
+      'Activate a license to keep auditing — your audit will start right after activation.',
+      'audit:' + scope);
+    return;
+  }
+
+  PropertiesService.getUserProperties().setProperty('FREE_AUDITS_USED', String(used + 1));
+  const remaining = FREE_AUDIT_LIMIT - used - 1;
+
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      remaining > 0
+        ? 'You have ' + remaining + ' free audit' + (remaining === 1 ? '' : 's') + ' left after this one.'
+        : 'This is your last free audit. Activate a license from the Drive Audit menu for unlimited audits.',
+      'Free audit ' + (used + 1) + ' of ' + FREE_AUDIT_LIMIT,
+      10
+    );
+  } catch (err) {
+    Logger.log('Could not show free-audit toast: ' + err.toString());
+  }
+
+  runDriveAudit(scope);
+}
 
 /**
  * Main function to audit Google Drive files and permissions
@@ -729,8 +892,22 @@ function createSummary(sheet, totalFiles, totalPermissions) {
  * Shows dialog to set up scheduled audit
  */
 function showScheduleDialog() {
+  if (!isLicensed()) {
+    showLicenseDialog(
+      '🔒 Weekly scheduled audits require a license. ' +
+      'Schedule setup will continue right after activation.',
+      'schedule');
+    return;
+  }
+  showScheduleConfirm();
+}
+
+/**
+ * The actual schedule setup confirmation (license already verified).
+ */
+function showScheduleConfirm() {
   const ui = SpreadsheetApp.getUi();
-  
+
   const result = ui.alert(
     'Setup Weekly Scheduled Audit',
     'Do you want to set up a weekly audit that runs automatically?\n\n' +
@@ -959,14 +1136,15 @@ function showAuditStatus() {
  * Shows the tutorial link
  */
 function showTutorial() {
-  const ui = SpreadsheetApp.getUi();
-  ui.alert(
-    'Tutorial',
-    'To learn how to use Drive Audit, visit the getting started guide:\n\n' +
-    'https://driveauditr.com/docs/getting-started/\n\n' +
-    'Copy and paste the link above into your browser.',
-    ui.ButtonSet.OK
-  );
+  const html = HtmlService.createHtmlOutput(
+    '<div style="font-family:\'Google Sans\',Roboto,Arial,sans-serif;font-size:14px;color:#202124;padding:4px 4px 0;">' +
+    '<p style="margin-top:0;">To learn how to use Drive Audit, visit the getting started guide:</p>' +
+    '<p><a href="https://driveauditr.com/docs/getting-started/" target="_blank" rel="noopener">' +
+    'https://driveauditr.com/docs/getting-started/</a></p>' +
+    '</div>')
+    .setWidth(400)
+    .setHeight(120);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Tutorial');
 }
 
 /**
@@ -991,22 +1169,24 @@ function showTutorial() {
 function showAbout() {
   const ui = SpreadsheetApp.getUi();
   ui.alert(
-    'Drive Audit - Open Source',
-    'Version: 2.0.0 (Open Source)\n\n' +
-    'This open-source tool audits your Google Drive files and their permissions.\n\n' +
+    'Drive Audit',
+    'Version: 2.0.0\n\n' +
+    'This tool audits your Google Drive files and their permissions.\n\n' +
     'Features:\n' +
     '• Lists all files you have access to\n' +
     '• Shows detailed permission information\n' +
     '• Identifies who has access to each file\n' +
     '• Real-time status tracking\n' +
-    '• Scheduled weekly audits\n' +
+    '• Scheduled weekly audits (license)\n' +
     '• Fast automatic continuation (1-minute intervals)\n' +
     '• Automatic continuation for large Drive accounts\n\n' +
     'Use the filters in the audit sheet to find:\n' +
     '• Files shared with "anyone"\n' +
     '• Files shared externally\n' +
     '• Files with specific roles (viewer, editor, etc.)\n\n' +
-    'This is free and open-source software.',
+    'Free version includes ' + FREE_AUDIT_LIMIT + ' audits. A license unlocks:\n' +
+    LICENSE_BENEFITS + '\n\n' +
+    'Get a license: use "Activate License Code" in the menu.',
     ui.ButtonSet.OK
   );
 }
