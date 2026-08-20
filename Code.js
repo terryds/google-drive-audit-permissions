@@ -582,7 +582,7 @@ function processDriveAuditBatch() {
         summarySheet = ss.insertSheet('Audit Summary', 0);
       }
       
-      createSummary(summarySheet, auditState.filesProcessed, auditState.auditDataCount);
+      createSummary(summarySheet, auditState.filesProcessed, auditState.auditDataCount, showFreeLimitNotice);
       
       const endTime = new Date();
       const totalDuration = (new Date(endTime) - new Date(auditState.startTime)) / 1000;
@@ -881,26 +881,42 @@ function getFileType(file) {
 /**
  * Creates a summary sheet with audit statistics
  */
-function createSummary(sheet, totalFiles, totalPermissions) {
+function createSummary(sheet, totalFiles, totalPermissions, freeLimitHit) {
   Logger.log('Generating summary data...');
-  
+
   const summaryData = [
     ['Drive Audit Summary', ''],
     ['', ''],
     ['Audit Date:', new Date()],
-    ['Total Files Audited:', totalFiles],
+    ['Total Files Audited:', freeLimitHit ? totalFiles + ' (free tier limit)' : totalFiles],
     ['Total Permission Entries:', totalPermissions],
-    ['', ''],
+    ['', '']
+  ];
+
+  // Free tier: results were truncated — show a prominent notice above
+  // the next steps. Row positions below shift, so they're tracked.
+  let noticeRow = 0;
+  if (freeLimitHit) {
+    noticeRow = summaryData.length + 1;
+    summaryData.push([
+      '🔒 FREE TIER LIMIT: only the first ' + FREE_FILE_LIMIT + ' files were audited. ' +
+      'Activate your license for only ' + LICENSE_PRICE + ' (one-time payment, lifetime access) ' +
+      'in Drive Audit > Activate License Code, then run the audit again for full results.', '']);
+    summaryData.push(['', '']);
+  }
+
+  const nextStepsRow = summaryData.length + 1;
+  summaryData.push(
     ['Next Steps:', ''],
     ['1. Review the "Drive Audit" sheet for detailed permissions', ''],
     ['2. Use filters to find files with specific sharing settings', ''],
     ['3. Look for files shared with "anyone" or external domains', ''],
     ['4. Set up a weekly schedule to run audits automatically', '']
-  ];
-  
+  );
+
   sheet.getRange(1, 1, summaryData.length, 2).setValues(summaryData);
   Logger.log('Summary data written to sheet');
-  
+
   // Format summary
   Logger.log('Formatting summary sheet...');
   sheet.getRange(1, 1, 1, 2).merge()
@@ -909,10 +925,21 @@ function createSummary(sheet, totalFiles, totalPermissions) {
     .setBackground('#4285f4')
     .setFontColor('#ffffff')
     .setHorizontalAlignment('center');
-  
+
   sheet.getRange(3, 1, 3, 1).setFontWeight('bold');
-  sheet.getRange(7, 1, 1, 1).setFontWeight('bold').setFontSize(12);
-  
+  sheet.getRange(nextStepsRow, 1, 1, 1).setFontWeight('bold').setFontSize(12);
+
+  if (noticeRow > 0) {
+    sheet.getRange(noticeRow, 1, 1, 2).merge()
+      .setFontSize(14)
+      .setFontWeight('bold')
+      .setBackground('#fce8b2')
+      .setFontColor('#b45309')
+      .setWrap(true)
+      .setVerticalAlignment('middle');
+    sheet.setRowHeight(noticeRow, 95);
+  }
+
   sheet.setColumnWidth(1, 300);
   sheet.setColumnWidth(2, 200);
   Logger.log('Summary formatting complete');
