@@ -15,11 +15,11 @@
 // ============ LICENSING ============
 
 const LICENSE_CHECKOUT_URL = 'https://terrydjony.lemonsqueezy.com/checkout/buy/07b31196-a486-47a7-a527-df65ce09ea8d';
-const FREE_AUDIT_LIMIT = 2;
+const FREE_FILE_LIMIT = 30; // free tier: results are capped at this many files
 const SUPPORT_EMAIL = 'driveauditr@terrydjony.com';
 
 const LICENSE_BENEFITS =
-  '• Unlimited audits (free version: ' + FREE_AUDIT_LIMIT + ' total)\n' +
+  '• Full audit results (free tier shows only the first ' + FREE_FILE_LIMIT + ' files)\n' +
   '• Weekly scheduled audits\n' +
   '• Prioritized customer support: ' + SUPPORT_EMAIL + '\n' +
   '  (reply within 1-2 business days max)';
@@ -38,13 +38,6 @@ function isValidLicenseCode(code) {
 function isLicensed() {
   const code = PropertiesService.getUserProperties().getProperty('LICENSE_CODE');
   return !!code && isValidLicenseCode(code);
-}
-
-/**
- * How many free audits the current user has run.
- */
-function getFreeAuditsUsed() {
-  return parseInt(PropertiesService.getUserProperties().getProperty('FREE_AUDITS_USED') || '0', 10);
 }
 
 /**
@@ -68,14 +61,14 @@ function activateLicense() {
  * @param {string} message    - contextual banner explaining why the dialog
  *                              appeared ('' for none)
  * @param {string} nextAction - what to do after successful activation:
- *                              'none' | 'schedule' | 'audit:<scope>'
+ *                              'none' | 'schedule'
  */
 function showLicenseDialog(message, nextAction) {
   const template = HtmlService.createTemplateFromFile('LicenseDialog');
   template.message = message || '';
   template.nextAction = nextAction || 'none';
   template.checkoutUrl = LICENSE_CHECKOUT_URL;
-  template.freeLimit = FREE_AUDIT_LIMIT;
+  template.freeLimit = FREE_FILE_LIMIT;
   template.supportEmail = SUPPORT_EMAIL;
 
   SpreadsheetApp.getUi().showModalDialog(
@@ -114,8 +107,6 @@ function continueAfterActivation(nextAction) {
 
   if (nextAction === 'schedule') {
     showScheduleConfirm();
-  } else if (nextAction && nextAction.indexOf('audit:') === 0) {
-    runDriveAudit(nextAction.split(':')[1]);
   }
 }
 
@@ -229,51 +220,9 @@ function updateAuditStatus(status, message, filesProcessed, totalFiles) {
  * - 'myDrive' : only files in your My Drive (skips shared/organizational drives)
  * - 'owned'   : only files you own
  */
-function runDriveAuditAll() { startAuditFromMenu('all'); }
-function runDriveAuditMyDrive() { startAuditFromMenu('myDrive'); }
-function runDriveAuditOwned() { startAuditFromMenu('owned'); }
-
-/**
- * License gate for audits started from the menu.
- * Licensed users run unlimited audits; free users get FREE_AUDIT_LIMIT total,
- * tracked per user in UserProperties. Scheduled triggers call runDriveAudit
- * directly and are not counted (the schedule itself requires a license).
- */
-function startAuditFromMenu(scope) {
-  if (isLicensed()) {
-    runDriveAudit(scope);
-    return;
-  }
-
-  const used = getFreeAuditsUsed();
-
-  if (used >= FREE_AUDIT_LIMIT) {
-    // Free audits exhausted. If they activate a license in the dialog,
-    // the audit they asked for starts automatically.
-    showLicenseDialog(
-      '🔒 You\'ve used your ' + FREE_AUDIT_LIMIT + ' free audits. ' +
-      'Activate a license to keep auditing — your audit will start right after activation.',
-      'audit:' + scope);
-    return;
-  }
-
-  PropertiesService.getUserProperties().setProperty('FREE_AUDITS_USED', String(used + 1));
-  const remaining = FREE_AUDIT_LIMIT - used - 1;
-
-  try {
-    SpreadsheetApp.getActiveSpreadsheet().toast(
-      remaining > 0
-        ? 'You have ' + remaining + ' free audit' + (remaining === 1 ? '' : 's') + ' left after this one.'
-        : 'This is your last free audit. Activate a license from the Drive Audit menu for unlimited audits.',
-      'Free audit ' + (used + 1) + ' of ' + FREE_AUDIT_LIMIT,
-      10
-    );
-  } catch (err) {
-    Logger.log('Could not show free-audit toast: ' + err.toString());
-  }
-
-  runDriveAudit(scope);
-}
+function runDriveAuditAll() { runDriveAudit('all'); }
+function runDriveAuditMyDrive() { runDriveAudit('myDrive'); }
+function runDriveAuditOwned() { runDriveAudit('owned'); }
 
 /**
  * Main function to audit Google Drive files and permissions
@@ -340,6 +289,11 @@ function processDriveAuditBatch() {
   const scriptProps = PropertiesService.getScriptProperties();
   
   try {
+    // Free tier caps results at FREE_FILE_LIMIT files. Re-checked on every
+    // execution (continuation triggers run as the user who started the
+    // audit, so UserProperties resolves to the right person).
+    const licensed = isLicensed();
+
     // Get or initialize audit state
     let auditState = scriptProps.getProperty('AUDIT_STATE');
     let isFirstRun = !auditState;
@@ -451,8 +405,17 @@ function processDriveAuditBatch() {
         const auditData = [];
         filesBatch.files.forEach(function(file) {
           auditState.filesProcessed++;
+
+          // Free tier: only the first FREE_FILE_LIMIT files get result rows.
+          // Files beyond the limit are still counted (no per-file API calls,
+          // so this is fast) so the final notice can say exactly how many
+          // results were withheld.
+          if (!licensed && auditState.filesProcessed > FREE_FILE_LIMIT) {
+            return;
+          }
+
           filesInThisBatch++;
-          
+
           const permissions = getFilePermissions(file.id);
           const folderPath = getFolderPath(file.parents, folderCache);
 
@@ -544,7 +507,7 @@ function processDriveAuditBatch() {
       // Auto-resize columns and add filter
       auditSheet = ss.getSheetByName('Drive Audit');
       const lastRow = auditSheet.getLastRow();
-      
+
       if (lastRow > 1) {
         Logger.log('Auto-resizing columns...');
         for (let i = 1; i <= 16; i++) {
@@ -554,7 +517,32 @@ function processDriveAuditBatch() {
         Logger.log('Adding filter...');
         auditSheet.getRange(1, 1, lastRow, 16).createFilter();
       }
-      
+
+      // Free tier: results were truncated — add a prominent notice right
+      // below the results. (Placed after the filter so it stays outside
+      // the filter range.)
+      const hiddenFiles = (!licensed && auditState.filesProcessed > FREE_FILE_LIMIT)
+        ? auditState.filesProcessed - FREE_FILE_LIMIT
+        : 0;
+
+      if (hiddenFiles > 0) {
+        Logger.log('Free tier: ' + hiddenFiles + ' files withheld. Adding upgrade notice...');
+        const noticeRow = auditSheet.getLastRow() + 2;
+        auditSheet.getRange(noticeRow, 1, 1, 16).merge();
+        auditSheet.getRange(noticeRow, 1)
+          .setValue('🔒 FREE TIER LIMIT: only the first ' + FREE_FILE_LIMIT + ' files are shown above. ' +
+            hiddenFiles + ' more file' + (hiddenFiles === 1 ? ' was' : 's were') + ' audited but ' +
+            (hiddenFiles === 1 ? 'is' : 'are') + ' not displayed because you are on the free tier. ' +
+            'Activate your license in Drive Audit > Activate License Code to see the full results.')
+          .setFontSize(14)
+          .setFontWeight('bold')
+          .setBackground('#fce8b2')
+          .setFontColor('#b45309')
+          .setWrap(true)
+          .setVerticalAlignment('middle');
+        auditSheet.setRowHeight(noticeRow, 70);
+      }
+
       // Create summary
       Logger.log('Creating summary sheet...');
       let summarySheet = ss.getSheetByName('Audit Summary');
@@ -576,11 +564,16 @@ function processDriveAuditBatch() {
       Logger.log('Permission entries: ' + auditState.auditDataCount);
       
       // Update status to COMPLETED
-      updateAuditStatus('COMPLETED', 
-        'Audit completed successfully! ' +
+      let completedMessage = 'Audit completed successfully! ' +
         'Files audited: ' + auditState.filesProcessed + ', ' +
         'Permission entries: ' + auditState.auditDataCount + ', ' +
-        'Duration: ' + Math.round(totalDuration) + ' seconds',
+        'Duration: ' + Math.round(totalDuration) + ' seconds';
+      if (hiddenFiles > 0) {
+        completedMessage += '. 🔒 Free tier: only the first ' + FREE_FILE_LIMIT +
+          ' files are displayed (' + hiddenFiles + ' not shown). ' +
+          'Activate your license in Drive Audit > Activate License Code to see all results.';
+      }
+      updateAuditStatus('COMPLETED', completedMessage,
         auditState.filesProcessed, auditState.filesProcessed);
       
       // Clear audit state
@@ -1184,7 +1177,7 @@ function showAbout() {
     '• Files shared with "anyone"\n' +
     '• Files shared externally\n' +
     '• Files with specific roles (viewer, editor, etc.)\n\n' +
-    'Free version includes ' + FREE_AUDIT_LIMIT + ' audits. A license unlocks:\n' +
+    'Free tier shows the first ' + FREE_FILE_LIMIT + ' files per audit. A license unlocks:\n' +
     LICENSE_BENEFITS + '\n\n' +
     'Get a license: use "Activate License Code" in the menu.',
     ui.ButtonSet.OK

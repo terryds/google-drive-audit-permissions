@@ -92,7 +92,7 @@
 
     <p class="benefits-title">A license unlocks:</p>
     <ul>
-      <li>Unlimited audits (free version: <?= freeLimit ?> total)</li>
+      <li>Full audit results (free tier shows only the first <?= freeLimit ?> files)</li>
       <li>Weekly scheduled audits</li>
       <li>Prioritized customer support &mdash;
         <a href="mailto:<?= supportEmail ?>"><?= supportEmail ?></a>
@@ -146,12 +146,8 @@
             setStatus('✅ License activated! Opening schedule setup...', 'success');
             google.script.run.continueAfterActivation(NEXT_ACTION);
             setTimeout(function () { google.script.host.close(); }, 1200);
-          } else if (NEXT_ACTION.indexOf('audit:') === 0) {
-            setStatus('✅ License activated! Starting your audit...', 'success');
-            google.script.run.continueAfterActivation(NEXT_ACTION);
-            setTimeout(function () { google.script.host.close(); }, 1200);
           } else {
-            setStatus('✅ License activated! You\'re all set — enjoy unlimited audits.', 'success');
+            setStatus('✅ License activated! Run a new audit (Drive Audit > Run Audit Now) to see your full results.', 'success');
             activateBtn.textContent = 'Close';
             activateBtn.disabled = false;
             activateBtn.onclick = function () { google.script.host.close(); };
