@@ -39,6 +39,12 @@
         font-size: 14px;
       }
       .buy-btn:hover { background: #1765cc; }
+      .price-note {
+        text-align: center;
+        color: #5f6368;
+        font-size: 12px;
+        margin: 6px 0 0;
+      }
       .divider {
         display: flex;
         align-items: center;
@@ -97,9 +103,11 @@
       <li>Prioritized customer support &mdash;
         <a href="mailto:<?= supportEmail ?>"><?= supportEmail ?></a>
         (reply within 1&ndash;2 business days max)</li>
+      <li><strong>Lifetime access</strong> for a one-time <?= price ?> payment</li>
     </ul>
 
-    <a class="buy-btn" href="<?= checkoutUrl ?>" target="_blank" rel="noopener">🛒 Get a License</a>
+    <a class="buy-btn" href="<?= checkoutUrl ?>" target="_blank" rel="noopener">🛒 Get a License — only <?= price ?></a>
+    <p class="price-note">One-time payment &middot; lifetime access &middot; not a subscription</p>
 
     <div class="divider">Already have a code?</div>
 

@@ -15,14 +15,16 @@
 // ============ LICENSING ============
 
 const LICENSE_CHECKOUT_URL = 'https://terrydjony.lemonsqueezy.com/checkout/buy/07b31196-a486-47a7-a527-df65ce09ea8d';
-const FREE_FILE_LIMIT = 30; // free tier: results are capped at this many files
+const FREE_FILE_LIMIT = 15; // free tier: results are capped at this many files
+const LICENSE_PRICE = '$12'; // one-time payment for lifetime access (not a subscription)
 const SUPPORT_EMAIL = 'driveauditr@terrydjony.com';
 
 const LICENSE_BENEFITS =
   '• Full audit results (free tier shows only the first ' + FREE_FILE_LIMIT + ' files)\n' +
   '• Weekly scheduled audits\n' +
   '• Prioritized customer support: ' + SUPPORT_EMAIL + '\n' +
-  '  (reply within 1-2 business days max)';
+  '  (reply within 1-2 business days max)\n' +
+  '• Lifetime access for a one-time ' + LICENSE_PRICE + ' payment';
 
 /**
  * Verifies a license code.
@@ -69,10 +71,11 @@ function showLicenseDialog(message, nextAction) {
   template.nextAction = nextAction || 'none';
   template.checkoutUrl = LICENSE_CHECKOUT_URL;
   template.freeLimit = FREE_FILE_LIMIT;
+  template.price = LICENSE_PRICE;
   template.supportEmail = SUPPORT_EMAIL;
 
   SpreadsheetApp.getUi().showModalDialog(
-    template.evaluate().setWidth(420).setHeight(400),
+    template.evaluate().setWidth(420).setHeight(450),
     'Drive Audit License');
 }
 
@@ -173,6 +176,7 @@ function updateAuditStatus(status, message, filesProcessed, totalFiles) {
       ['Current Status:', status],
       ['Last Updated:', new Date()],
       ['Message:', message],
+      ['Results Location:', 'The "Drive Audit" sheet — results appear there as the audit runs'],
       ['', '']
     ];
     
@@ -203,6 +207,8 @@ function updateAuditStatus(status, message, filesProcessed, totalFiles) {
       statusCell.setBackground('#f8d7da').setFontColor('#721c24');
     } else if (status === 'CANCELLED') {
       statusCell.setBackground('#e0e0e0').setFontColor('#424242');
+    } else if (status === 'FREE LIMIT HIT') {
+      statusCell.setBackground('#fce8b2').setFontColor('#b45309').setFontWeight('bold');
     }
     
     statusSheet.setColumnWidth(1, 200);
@@ -263,6 +269,7 @@ function runDriveAudit(scope) {
     'Starting audit... This may take several minutes depending on the number of files.\n\n' +
     '⏳ The audit will run in the background.\n' +
     '📊 Check the "Audit Status" sheet for progress.\n' +
+    '📄 Results will appear in the "Drive Audit" sheet when ready.\n' +
     '⏱️ For large Drive accounts (1000+ files):\n' +
     '   • Processes ~500 files every 4.5 minutes\n' +
     '   • Auto-continues every minute if needed\n' +
@@ -358,6 +365,18 @@ function processDriveAuditBatch() {
       
       auditSheet.setFrozenRows(1);
       Logger.log('Headers created successfully');
+
+      // Creating the "Drive Audit" sheet makes it the active tab, leaving
+      // the user staring at an empty sheet while the audit runs. Switch
+      // them back to "Audit Status", which shows live progress.
+      try {
+        const statusSheet = ss.getSheetByName('Audit Status');
+        if (statusSheet) {
+          ss.setActiveSheet(statusSheet);
+        }
+      } catch (err) {
+        Logger.log('Could not switch to the status sheet: ' + err.toString());
+      }
       
       auditState.phase = 'PROCESSING';
       scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
@@ -401,19 +420,22 @@ function processDriveAuditBatch() {
         
         Logger.log('Processing batch of ' + filesBatch.files.length + ' files');
         
+        // Free tier: the audit is a preview capped at FREE_FILE_LIMIT files.
+        // Trim this page to the remaining slots; anything cut off means
+        // results were withheld, which the final notice points out.
+        let filesToProcess = filesBatch.files;
+        if (!licensed) {
+          const remainingSlots = Math.max(0, FREE_FILE_LIMIT - auditState.filesProcessed);
+          if (filesToProcess.length > remainingSlots) {
+            filesToProcess = filesToProcess.slice(0, remainingSlots);
+            auditState.truncated = true;
+          }
+        }
+
         // Process files
         const auditData = [];
-        filesBatch.files.forEach(function(file) {
+        filesToProcess.forEach(function(file) {
           auditState.filesProcessed++;
-
-          // Free tier: only the first FREE_FILE_LIMIT files get result rows.
-          // Files beyond the limit are still counted (no per-file API calls,
-          // so this is fast) so the final notice can say exactly how many
-          // results were withheld.
-          if (!licensed && auditState.filesProcessed > FREE_FILE_LIMIT) {
-            return;
-          }
-
           filesInThisBatch++;
 
           const permissions = getFilePermissions(file.id);
@@ -484,7 +506,18 @@ function processDriveAuditBatch() {
           auditState.phase = 'FINALIZING';
           continueProcessing = false;
         }
-        
+
+        // Free tier: preview complete — finish now instead of scanning the
+        // rest of the Drive.
+        if (!licensed && auditState.filesProcessed >= FREE_FILE_LIMIT) {
+          if (auditState.pageToken) {
+            auditState.truncated = true;
+          }
+          Logger.log('Free tier limit of ' + FREE_FILE_LIMIT + ' files reached. Finalizing.');
+          auditState.phase = 'FINALIZING';
+          continueProcessing = false;
+        }
+
         // Save state periodically
         scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
       }
@@ -521,26 +554,23 @@ function processDriveAuditBatch() {
       // Free tier: results were truncated — add a prominent notice right
       // below the results. (Placed after the filter so it stays outside
       // the filter range.)
-      const hiddenFiles = (!licensed && auditState.filesProcessed > FREE_FILE_LIMIT)
-        ? auditState.filesProcessed - FREE_FILE_LIMIT
-        : 0;
+      const showFreeLimitNotice = !licensed && auditState.truncated;
 
-      if (hiddenFiles > 0) {
-        Logger.log('Free tier: ' + hiddenFiles + ' files withheld. Adding upgrade notice...');
+      if (showFreeLimitNotice) {
+        Logger.log('Free tier: results truncated. Adding upgrade notice...');
         const noticeRow = auditSheet.getLastRow() + 2;
         auditSheet.getRange(noticeRow, 1, 1, 16).merge();
         auditSheet.getRange(noticeRow, 1)
           .setValue('🔒 FREE TIER LIMIT: only the first ' + FREE_FILE_LIMIT + ' files are shown above. ' +
-            hiddenFiles + ' more file' + (hiddenFiles === 1 ? ' was' : 's were') + ' audited but ' +
-            (hiddenFiles === 1 ? 'is' : 'are') + ' not displayed because you are on the free tier. ' +
-            'Activate your license in Drive Audit > Activate License Code to see the full results.')
+            'Activate your license for only ' + LICENSE_PRICE + ' — one-time payment, lifetime access, ' +
+            'no subscription — in Drive Audit > Activate License Code to see the full results.')
           .setFontSize(14)
           .setFontWeight('bold')
           .setBackground('#fce8b2')
           .setFontColor('#b45309')
           .setWrap(true)
           .setVerticalAlignment('middle');
-        auditSheet.setRowHeight(noticeRow, 70);
+        auditSheet.setRowHeight(noticeRow, 55);
       }
 
       // Create summary
@@ -563,18 +593,25 @@ function processDriveAuditBatch() {
       Logger.log('Files audited: ' + auditState.filesProcessed);
       Logger.log('Permission entries: ' + auditState.auditDataCount);
       
-      // Update status to COMPLETED
-      let completedMessage = 'Audit completed successfully! ' +
-        'Files audited: ' + auditState.filesProcessed + ', ' +
-        'Permission entries: ' + auditState.auditDataCount + ', ' +
-        'Duration: ' + Math.round(totalDuration) + ' seconds';
-      if (hiddenFiles > 0) {
-        completedMessage += '. 🔒 Free tier: only the first ' + FREE_FILE_LIMIT +
-          ' files are displayed (' + hiddenFiles + ' not shown). ' +
-          'Activate your license in Drive Audit > Activate License Code to see all results.';
+      // Update the final status. A truncated free-tier run is reported as
+      // FREE LIMIT HIT rather than COMPLETED — the Drive was NOT fully
+      // audited, and the status should lead with how to unlock the rest.
+      if (showFreeLimitNotice) {
+        updateAuditStatus('FREE LIMIT HIT',
+          '🔒 Free preview finished: only the first ' + FREE_FILE_LIMIT + ' files were audited. ' +
+          'Activate your license for only ' + LICENSE_PRICE + ' (one-time payment, lifetime access) ' +
+          'in Drive Audit > Activate License Code, then run the audit again for full access. ' +
+          'Permission entries: ' + auditState.auditDataCount + ', ' +
+          'Duration: ' + Math.round(totalDuration) + ' seconds',
+          auditState.filesProcessed, auditState.filesProcessed);
+      } else {
+        updateAuditStatus('COMPLETED',
+          'Audit completed successfully! ' +
+          'Files audited: ' + auditState.filesProcessed + ', ' +
+          'Permission entries: ' + auditState.auditDataCount + ', ' +
+          'Duration: ' + Math.round(totalDuration) + ' seconds',
+          auditState.filesProcessed, auditState.filesProcessed);
       }
-      updateAuditStatus('COMPLETED', completedMessage,
-        auditState.filesProcessed, auditState.filesProcessed);
       
       // Clear audit state
       scriptProps.deleteProperty('AUDIT_STATE');
@@ -1106,6 +1143,8 @@ function showAuditStatus() {
       icon = '❌';
     } else if (status === 'CANCELLED') {
       icon = '🛑';
+    } else if (status === 'FREE LIMIT HIT') {
+      icon = '🔒';
     }
     
     let displayMessage = icon + ' Status: ' + status + '\n\n' +
