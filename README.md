@@ -22,6 +22,7 @@ Tutorial is published on [my blog.terrydjony.com](https://blog.terrydjony.com/go
 - 🔍 **Filterable Results**: Easy-to-filter spreadsheet for finding specific sharing patterns
 - ⏳ **Real-Time Status Tracking**: Monitor audit progress with live status updates
 - 🔄 **Automatic Continuation**: Handles very large Drive accounts by processing in batches with 1-minute intervals - no timeouts!
+- 🛟 **Self-Recovery**: If a batch fails or Google's daily script quota runs out, the audit picks up again by itself from where it stopped
 - ⚡ **Fast Processing**: Uses 1-minute continuation intervals for quick completion
 
 ## What It Tracks
@@ -92,7 +93,7 @@ For each file, the tool captures:
 3. The audit runs in the background with automatic continuation every minute:
    - ⏳ Check the **"Audit Status"** sheet for real-time progress
    - 📊 Or click **Drive Audit** → **Check Audit Status**
-   - ⚡ Processes ~500 files every 5 minutes
+   - ⚡ Works in chunks of about 5 minutes; you can close the sheet while it runs
 4. When complete, review the results in the "Drive Audit" sheet
 
 ### Checking Audit Status
@@ -102,6 +103,13 @@ Click **Drive Audit** → **Check Audit Status** to see:
 - Progress percentage
 - Last update time
 - Estimated time remaining
+
+### Resuming a Stalled Audit
+
+The audit recovers by itself, so you normally never need this. If the "Audit Status" sheet shows **PAUSED**, or "Last Updated" hasn't changed for more than a day:
+
+1. Click **Drive Audit** → **Resume Stalled Audit**
+2. The audit continues from where it stopped; results already collected are kept
 
 ### Cancelling a Running Audit
 
@@ -135,6 +143,7 @@ If you need to stop an audit that's currently running:
 - 🟢 **COMPLETED** (green) - Audit finished successfully
 - 🟡 **RUNNING** (yellow) - Audit is in progress
 - 🛑 **CANCELLED** (gray) - Audit was cancelled by user
+- ⏸️ **PAUSED** (orange) - The audit couldn't schedule its next step; use **Resume Stalled Audit**
 - 🔴 **ERROR** (red) - An error occurred
 - Shows real-time progress percentage
 - Last updated timestamp
@@ -194,6 +203,12 @@ This script requires the following permissions:
   - This repeats until all files are processed
   - You can monitor progress in the "Audit Status" sheet
   - The entire process is automatic - no manual intervention needed
+
+### Audit Seems Stuck ("Last Updated" Stopped Changing)
+- Google limits how long scripts may run in the background per day: about 90 minutes for free Gmail accounts and 6 hours for Google Workspace accounts
+- When a very large audit uses up that allowance, it waits and continues by itself once the limit resets (within 24 hours). Nothing is lost
+- **Don't start a new audit** - that discards the results collected so far
+- If the status is still unchanged a day later, click **Drive Audit** → **Resume Stalled Audit**
 
 ### Missing Files
 - The tool only shows files you have access to

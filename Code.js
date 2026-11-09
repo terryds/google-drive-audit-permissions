@@ -136,6 +136,7 @@ function onOpen(e) {
       .addItem('My Drive only (skip shared drives)', 'runDriveAuditMyDrive')
       .addItem('Only files I own', 'runDriveAuditOwned'))
     .addItem('Check Audit Status', 'showAuditStatus')
+    .addItem('Resume Stalled Audit', 'resumeAudit')
     .addItem('Cancel Running Audit', 'cancelRunningAudit')
     .addSeparator()
     .addItem('Setup Weekly Schedule', 'showScheduleDialog')
@@ -207,6 +208,8 @@ function updateAuditStatus(status, message, filesProcessed, totalFiles) {
       statusCell.setBackground('#f8d7da').setFontColor('#721c24');
     } else if (status === 'CANCELLED') {
       statusCell.setBackground('#e0e0e0').setFontColor('#424242');
+    } else if (status === 'PAUSED') {
+      statusCell.setBackground('#fce8b2').setFontColor('#b45309');
     } else if (status === 'FREE LIMIT HIT') {
       statusCell.setBackground('#fce8b2').setFontColor('#b45309').setFontWeight('bold');
     }
@@ -230,9 +233,34 @@ function runDriveAuditAll() { runDriveAudit('all'); }
 function runDriveAuditMyDrive() { runDriveAudit('myDrive'); }
 function runDriveAuditOwned() { runDriveAudit('owned'); }
 
+// ============ AUDIT ENGINE ============
+//
+// An audit of a large Drive takes far longer than one Apps Script execution
+// is allowed to run (6 minutes), so it runs as a series of executions that
+// each pick up where the last one stopped. Progress lives in the
+// AUDIT_STATE script property. Two triggers keep the series going:
+//
+// - a one-shot "continuation" trigger, created at the end of each
+//   execution, which starts the next one a minute later;
+// - a recurring "watchdog" trigger, which restarts the series if it ever
+//   breaks: an execution killed by Google, a continuation trigger that
+//   could not be created, or the daily trigger-runtime quota running out
+//   (90 minutes for consumer accounts) and resetting the next day.
+
+// Each execution stops itself after this long, leaving a buffer before
+// Google's hard 6-minute kill.
+const MAX_EXECUTION_TIME_MS = 4.5 * 60 * 1000;
+const CONTINUATION_DELAY_MINUTES = 1;
+const WATCHDOG_INTERVAL_MINUTES = 10;
+// Consecutive failed executions before the audit gives up with an ERROR.
+const MAX_CONSECUTIVE_ERRORS = 5;
+const STATUS_UPDATE_INTERVAL_MS = 30 * 1000;
+// Upper bound on the time an execution spends preloading folders.
+const FOLDER_PRELOAD_TIME_MS = 60 * 1000;
+
 /**
- * Main function to audit Google Drive files and permissions
- * This version handles timeouts by processing in batches
+ * Main function to audit Google Drive files and permissions.
+ * Starts a fresh audit; the work itself happens in runAuditBatch.
  *
  * @param {string} scope - 'all' | 'myDrive' | 'owned'. Defaults to 'all'
  *   (e.g. when invoked by the scheduled weekly trigger).
@@ -242,100 +270,224 @@ function runDriveAudit(scope) {
     scope = 'all';
   }
 
-  // Clear any previous audit state and record the requested scope
+  // The weekly schedule calls this from a time-based trigger, where there
+  // is no UI to show a dialog in (getUi() throws there).
+  let ui = null;
+  try {
+    ui = SpreadsheetApp.getUi();
+  } catch (err) {
+    Logger.log('No UI available (running from a trigger): ' + err.toString());
+  }
+
+  // Stop any previous audit. If one of its executions is still running, it
+  // notices its state is gone and stops without saving.
   const scriptProps = PropertiesService.getScriptProperties();
-  scriptProps.deleteProperty('AUDIT_STATE');
-  scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
-  scriptProps.setProperty('AUDIT_SCOPE', scope);
+  clearAuditState(scriptProps);
+  deleteAuditTriggers();
 
   Logger.log('=== DRIVE AUDIT STARTED (FRESH) ===');
   Logger.log('Scope: ' + scope);
   Logger.log('Start time: ' + new Date().toISOString());
-  
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ui = SpreadsheetApp.getUi();
-  
+
   // Update status to RUNNING
-  updateAuditStatus('RUNNING', 
-    'Audit is in progress. For large Drive accounts, this may take some time. The audit will automatically continue every minute if needed.', 
+  updateAuditStatus('RUNNING',
+    'Audit is starting. For large Drive accounts this may take some time; it continues automatically in the background.',
     0, 0);
-  
+
   // Show progress message
-  const scopeLabel = scope === 'myDrive'
-    ? 'My Drive only (shared drives skipped)'
-    : (scope === 'owned' ? 'Only files you own' : 'All Drives (including shared)');
-  ui.alert('Drive Audit',
-    'Scope: ' + scopeLabel + '\n\n' +
-    'Starting audit... This may take several minutes depending on the number of files.\n\n' +
-    '⏳ The audit will run in the background.\n' +
-    '📊 Check the "Audit Status" sheet for progress.\n' +
-    '📄 Results will appear in the "Drive Audit" sheet when ready.\n' +
-    '⏱️ For large Drive accounts (1000+ files):\n' +
-    '   • Processes ~500 files every 4.5 minutes\n' +
-    '   • Auto-continues every minute if needed\n' +
-    '   • May take some time to complete\n\n' +
-    'Click OK to start.',
-    ui.ButtonSet.OK);
-  
-  // Call the batch processor
-  processDriveAuditBatch();
+  if (ui) {
+    const scopeLabel = scope === 'myDrive'
+      ? 'My Drive only (shared drives skipped)'
+      : (scope === 'owned' ? 'Only files you own' : 'All Drives (including shared)');
+    ui.alert('Drive Audit',
+      'Scope: ' + scopeLabel + '\n\n' +
+      'Starting audit... This may take several minutes depending on the number of files.\n\n' +
+      '⏳ The audit will run in the background.\n' +
+      '📊 Check the "Audit Status" sheet for progress.\n' +
+      '📄 Results will appear in the "Drive Audit" sheet when ready.\n' +
+      '⏱️ For large Drive accounts (1000+ files):\n' +
+      '   • Works in chunks of about 5 minutes and continues automatically\n' +
+      '   • Picks itself back up if a chunk fails or Google\'s daily quota runs out\n' +
+      '   • You can close this sheet while it runs\n\n' +
+      'Click OK to start.',
+      ui.ButtonSet.OK);
+  }
+
+  const auditState = {
+    runId: Utilities.getUuid(),
+    phase: 'SETUP',
+    scope: scope,
+    filesProcessed: 0,
+    auditDataCount: 0,
+    pageToken: null,
+    pageOffset: 0,
+    nextRow: 2,
+    startTime: new Date().toISOString()
+  };
+  scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
+  ensureWatchdogTrigger();
+
+  // An execution of the previous audit may still hold the lock for a few
+  // seconds. If it doesn't let go in time, start through a trigger instead.
+  if (!runAuditBatch(30 * 1000)) {
+    scheduleAuditContinuation(auditState);
+  }
 }
 
 /**
- * Processes the drive audit in batches to avoid timeouts
- * Can be called multiple times to continue where it left off
+ * Menu entry point: restarts the background processing of an audit that
+ * has stopped making progress, continuing from where it left off.
+ */
+function resumeAudit() {
+  const ui = SpreadsheetApp.getUi();
+  const scriptProps = PropertiesService.getScriptProperties();
+
+  let auditState = null;
+  try {
+    auditState = JSON.parse(scriptProps.getProperty('AUDIT_STATE'));
+  } catch (error) {
+    auditState = null;
+  }
+
+  if (!auditState) {
+    ui.alert('No Audit To Resume',
+      'There is no unfinished audit.\n\n' +
+      'Use "Run Audit Now" to start a new one.',
+      ui.ButtonSet.OK);
+    return;
+  }
+
+  if (scheduleAuditContinuation(auditState)) {
+    ui.alert('Audit Resumed',
+      'The audit will continue in the background within a couple of minutes, ' +
+      'from where it stopped.\n\n' +
+      'Check the "Audit Status" sheet for progress.',
+      ui.ButtonSet.OK);
+    return;
+  }
+
+  // Background triggers can't be created, so do one chunk of the work
+  // right here instead.
+  runAuditBatch(1000);
+  if (scriptProps.getProperty('AUDIT_STATE')) {
+    ui.alert('Audit Partly Resumed',
+      'The audit could not be scheduled to run in the background, so one ' +
+      'chunk of it was processed just now.\n\n' +
+      'Choose "Resume Stalled Audit" again to process the next chunk. ' +
+      'Check the "Audit Status" sheet for progress.',
+      ui.ButtonSet.OK);
+  } else {
+    ui.alert('Audit Finished',
+      'The audit has ended. Check the "Audit Status" sheet for the result.',
+      ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Handler of the one-shot continuation trigger.
  */
 function processDriveAuditBatch() {
+  runAuditBatch(1000);
+}
+
+/**
+ * Handler of the recurring watchdog trigger. Does nothing while another
+ * execution is working on the audit.
+ */
+function auditWatchdog() {
+  runAuditBatch(1000);
+}
+
+/**
+ * Runs one execution's worth of the audit, unless another execution is
+ * already doing so.
+ *
+ * @param {number} lockWaitMs - how long to wait for a running execution
+ * @return {boolean} false if another execution held the lock throughout
+ */
+function runAuditBatch(lockWaitMs) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(lockWaitMs)) {
+    Logger.log('Another execution is processing the audit. Skipping.');
+    return false;
+  }
+
+  try {
+    processAuditBatchLocked();
+  } finally {
+    lock.releaseLock();
+  }
+  return true;
+}
+
+/**
+ * Processes the drive audit in batches to avoid timeouts.
+ * Continues from the saved state; only one execution runs this at a time.
+ */
+function processAuditBatchLocked() {
   Logger.log('=== BATCH PROCESSING STARTED ===');
   Logger.log('Start time: ' + new Date().toISOString());
-  
+
   const startTime = new Date().getTime();
-  const MAX_EXECUTION_TIME = 4.5 * 60 * 1000; // 4.5 minutes (leaving 1.5 min buffer)
-  
+  const outOfTime = function() {
+    return new Date().getTime() - startTime > MAX_EXECUTION_TIME_MS;
+  };
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const scriptProps = PropertiesService.getScriptProperties();
-  
+
+  const savedState = scriptProps.getProperty('AUDIT_STATE');
+  if (!savedState) {
+    // Finished or cancelled: a trigger that outlived its audit.
+    Logger.log('No audit in progress. Removing audit triggers.');
+    deleteAuditTriggers();
+    return;
+  }
+
+  let auditState = null;
+
   try {
+    auditState = JSON.parse(savedState);
+    Logger.log('Continuing audit from phase: ' + auditState.phase);
+    Logger.log('Files processed so far: ' + auditState.filesProcessed);
+
+    let auditSheet = ss.getSheetByName('Drive Audit');
+
+    // State saved by an older version of this script, which didn't track
+    // which sheet row each saved position corresponds to. Continuing from
+    // it could silently skip or repeat files, so don't.
+    if (!auditState.runId) {
+      updateAuditStatus('ERROR',
+        'This audit was started with an older version of Drive Audit and can\'t be continued. ' +
+        'Please start a new one from Drive Audit > Run Audit Now.',
+        0, 0);
+      clearAuditState(scriptProps);
+      deleteAuditTriggers();
+      return;
+    }
+
     // Free tier caps results at FREE_FILE_LIMIT files. Re-checked on every
     // execution (continuation triggers run as the user who started the
     // audit, so UserProperties resolves to the right person).
     const licensed = isLicensed();
 
-    // Get or initialize audit state
-    let auditState = scriptProps.getProperty('AUDIT_STATE');
-    let isFirstRun = !auditState;
-    
-    if (!auditState) {
-      Logger.log('First run - initializing audit');
-      auditState = {
-        phase: 'SETUP',
-        scope: scriptProps.getProperty('AUDIT_SCOPE') || 'all',
-        totalFilesFound: 0,
-        filesProcessed: 0,
-        auditDataCount: 0,
-        pageToken: null,
-        startTime: new Date().toISOString()
-      };
-      Logger.log('Audit scope: ' + auditState.scope);
-    } else {
-      auditState = JSON.parse(auditState);
-      Logger.log('Continuing audit from phase: ' + auditState.phase);
-      Logger.log('Files processed so far: ' + auditState.filesProcessed);
-    }
-    
-    let auditSheet = ss.getSheetByName('Drive Audit');
-    
     // SETUP PHASE
     if (auditState.phase === 'SETUP') {
       Logger.log('Setting up audit sheet...');
       if (auditSheet) {
         Logger.log('Clearing existing "Drive Audit" sheet');
         auditSheet.clear();
+        // clear() keeps the previous audit's filter, and a sheet can only
+        // have one: finalizing would fail when it creates the new one.
+        const previousFilter = auditSheet.getFilter();
+        if (previousFilter) {
+          previousFilter.remove();
+        }
       } else {
         Logger.log('Creating new "Drive Audit" sheet');
         auditSheet = ss.insertSheet('Drive Audit');
       }
-      
+
       // Set up headers
       Logger.log('Setting up headers...');
       const headers = [
@@ -356,13 +508,13 @@ function processDriveAuditBatch() {
         'Permission Domain',
         'Permission Display Name'
       ];
-      
+
       auditSheet.getRange(1, 1, 1, headers.length)
         .setValues([headers])
         .setFontWeight('bold')
         .setBackground('#4285f4')
         .setFontColor('#ffffff');
-      
+
       auditSheet.setFrozenRows(1);
       Logger.log('Headers created successfully');
 
@@ -377,178 +529,161 @@ function processDriveAuditBatch() {
       } catch (err) {
         Logger.log('Could not switch to the status sheet: ' + err.toString());
       }
-      
+
       auditState.phase = 'PROCESSING';
-      scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
-    }
-    
-    // PROCESSING PHASE
-    if (auditState.phase === 'PROCESSING') {
-      Logger.log('Processing files...');
-      updateAuditStatus('RUNNING', 
-        'Processing files and permissions...', 
-        auditState.filesProcessed, 0);
-      
-      // Process files in batches, with automatic continuation
-      // This number is tuned to stay under the 4.5 minute limit while processing as much as possible
-      const BATCH_SIZE = 500; // Process up to 500 files at a time (or until time limit)
-      let filesInThisBatch = 0;
-      let continueProcessing = true;
-
-      // Cache of folder id -> folder resource, to avoid re-fetching the same
-      // ancestor folders when resolving full folder paths within this run.
-      const folderCache = {};
-      
-      while (continueProcessing && filesInThisBatch < BATCH_SIZE) {
-        // Check execution time
-        const elapsedTime = new Date().getTime() - startTime;
-        if (elapsedTime > MAX_EXECUTION_TIME) {
-          Logger.log('Approaching timeout limit. Saving state and scheduling continuation...');
-          scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
-          scheduleAuditContinuation();
-          return;
-        }
-        
-        // Get next batch of files
-        const filesBatch = getDriveFilesBatch(auditState.pageToken, 100, auditState.scope);
-        
-        if (!filesBatch || !filesBatch.files || filesBatch.files.length === 0) {
-          Logger.log('No more files to process');
-          auditState.phase = 'FINALIZING';
-          break;
-        }
-        
-        Logger.log('Processing batch of ' + filesBatch.files.length + ' files');
-        
-        // Free tier: the audit is a preview capped at FREE_FILE_LIMIT files.
-        // Trim this page to the remaining slots; anything cut off means
-        // results were withheld, which the final notice points out.
-        let filesToProcess = filesBatch.files;
-        if (!licensed) {
-          const remainingSlots = Math.max(0, FREE_FILE_LIMIT - auditState.filesProcessed);
-          if (filesToProcess.length > remainingSlots) {
-            filesToProcess = filesToProcess.slice(0, remainingSlots);
-            auditState.truncated = true;
-          }
-        }
-
-        // Process files
-        const auditData = [];
-        filesToProcess.forEach(function(file) {
-          auditState.filesProcessed++;
-          filesInThisBatch++;
-
-          const permissions = getFilePermissions(file.id);
-          const folderPath = getFolderPath(file.parents, folderCache);
-
-          if (permissions.length === 0) {
-            auditData.push([
-              file.name,
-              folderPath,
-              file.id,
-              file.owners && file.owners.length > 0 ? file.owners[0].emailAddress : 'Unknown',
-              getFileType(file),
-              file.mimeType,
-              file.createdTime ? new Date(file.createdTime) : '',
-              file.modifiedTime ? new Date(file.modifiedTime) : '',
-              file.size || '',
-              file.webViewLink || '',
-              0,
-              '',
-              '',
-              '',
-              '',
-              ''
-            ]);
-          } else {
-            permissions.forEach(function(permission) {
-              auditData.push([
-                file.name,
-                folderPath,
-                file.id,
-                file.owners && file.owners.length > 0 ? file.owners[0].emailAddress : 'Unknown',
-                getFileType(file),
-                file.mimeType,
-                file.createdTime ? new Date(file.createdTime) : '',
-                file.modifiedTime ? new Date(file.modifiedTime) : '',
-                file.size || '',
-                file.webViewLink || '',
-                permissions.length,
-                permission.type,
-                permission.role,
-                permission.emailAddress || '',
-                permission.domain || '',
-                permission.displayName || ''
-              ]);
-            });
-          }
-        });
-        
-        // Write data to sheet
-        if (auditData.length > 0) {
-          const lastRow = auditSheet.getLastRow();
-          auditSheet.getRange(lastRow + 1, 1, auditData.length, 16).setValues(auditData);
-          auditState.auditDataCount += auditData.length;
-          Logger.log('Wrote ' + auditData.length + ' rows. Total rows: ' + auditState.auditDataCount);
-        }
-        
-        // Update page token
-        auditState.pageToken = filesBatch.nextPageToken;
-        
-        // Update status every 50 files
-        if (auditState.filesProcessed % 50 === 0) {
-          updateAuditStatus('RUNNING', 'Processing files... ' + auditState.filesProcessed + ' files processed', auditState.filesProcessed, 0);
-        }
-        
-        // Check if there are more pages
-        if (!auditState.pageToken) {
-          Logger.log('All files processed');
-          auditState.phase = 'FINALIZING';
-          continueProcessing = false;
-        }
-
-        // Free tier: preview complete — finish now instead of scanning the
-        // rest of the Drive.
-        if (!licensed && auditState.filesProcessed >= FREE_FILE_LIMIT) {
-          if (auditState.pageToken) {
-            auditState.truncated = true;
-          }
-          Logger.log('Free tier limit of ' + FREE_FILE_LIMIT + ' files reached. Finalizing.');
-          auditState.phase = 'FINALIZING';
-          continueProcessing = false;
-        }
-
-        // Save state periodically
-        scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
-      }
-      
-      // If still processing, schedule continuation
-      if (auditState.phase === 'PROCESSING') {
-        Logger.log('Batch complete. Files processed in this run: ' + filesInThisBatch);
-        Logger.log('Total files processed: ' + auditState.filesProcessed);
-        scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
-        scheduleAuditContinuation();
+      if (!saveAuditState(scriptProps, auditState)) {
+        Logger.log('Audit was cancelled or restarted. Stopping.');
         return;
       }
     }
-    
+
+    // PROCESSING PHASE
+    if (auditState.phase === 'PROCESSING') {
+      Logger.log('Processing files...');
+
+      if (!auditSheet) {
+        throw new Error('The "Drive Audit" sheet is missing. Please run a new audit.');
+      }
+
+      // Rows below the saved position were written by an execution that
+      // was killed before it could save its progress. They are processed
+      // again now, so remove them rather than duplicate them.
+      const lastWrittenRow = auditSheet.getLastRow();
+      if (lastWrittenRow >= auditState.nextRow) {
+        Logger.log('Removing ' + (lastWrittenRow - auditState.nextRow + 1) + ' unsaved rows from an interrupted run');
+        auditSheet.getRange(auditState.nextRow, 1, lastWrittenRow - auditState.nextRow + 1, 16).clearContent();
+      }
+
+      updateAuditStatus('RUNNING', auditProgressMessage(auditState), auditState.filesProcessed, 0);
+      let lastStatusUpdate = new Date().getTime();
+
+      // Folder id -> { name, parent }, for resolving full folder paths.
+      // The free preview only needs the folders of a handful of files.
+      const folderCache = {};
+      if (licensed) {
+        preloadFolders(folderCache, auditState.scope);
+      }
+
+      // Work through the Drive one page of files at a time until this
+      // execution runs out of time. The clock is checked before every file
+      // so a slow page can't push the execution past Google's hard limit.
+      while (auditState.phase === 'PROCESSING' && !outOfTime()) {
+        const filesBatch = getDriveFilesBatch(auditState.pageToken, 100, auditState.scope);
+        const files = filesBatch.files || [];
+
+        const auditData = [];
+        let fileIndex = auditState.pageOffset || 0;
+        let freeLimitReached = false;
+
+        for (; fileIndex < files.length; fileIndex++) {
+          if (outOfTime()) {
+            break;
+          }
+
+          // Free tier: the audit is a preview capped at FREE_FILE_LIMIT
+          // files. Stopping with files left over means results were
+          // withheld, which the final notice points out.
+          if (!licensed && auditState.filesProcessed >= FREE_FILE_LIMIT) {
+            freeLimitReached = true;
+            break;
+          }
+
+          appendAuditRows(auditData, files[fileIndex], folderCache);
+          auditState.filesProcessed++;
+        }
+
+        // Write data to sheet
+        if (auditData.length > 0) {
+          auditSheet.getRange(auditState.nextRow, 1, auditData.length, 16).setValues(auditData);
+          auditState.nextRow += auditData.length;
+          auditState.auditDataCount += auditData.length;
+          Logger.log('Wrote ' + auditData.length + ' rows. Total rows: ' + auditState.auditDataCount);
+        }
+
+        const stoppedMidPage = fileIndex < files.length;
+
+        if (stoppedMidPage) {
+          // Continue this same page from this file next time
+          auditState.pageOffset = fileIndex;
+          if (freeLimitReached) {
+            auditState.truncated = true;
+            auditState.phase = 'FINALIZING';
+          }
+        } else {
+          // An empty page is not the end of the list: only a missing
+          // nextPageToken is.
+          auditState.pageToken = filesBatch.nextPageToken || null;
+          auditState.pageOffset = 0;
+
+          if (!auditState.pageToken) {
+            Logger.log('All files processed');
+            auditState.phase = 'FINALIZING';
+          } else if (!licensed && auditState.filesProcessed >= FREE_FILE_LIMIT) {
+            // Free tier: preview complete — finish now instead of
+            // scanning the rest of the Drive.
+            Logger.log('Free tier limit of ' + FREE_FILE_LIMIT + ' files reached. Finalizing.');
+            auditState.truncated = true;
+            auditState.phase = 'FINALIZING';
+          }
+        }
+
+        // Save progress. The rows go to the sheet first: if this
+        // execution dies in between, the next one redoes this page
+        // instead of skipping it.
+        auditState.consecutiveErrors = 0;
+        SpreadsheetApp.flush();
+        if (!saveAuditState(scriptProps, auditState)) {
+          Logger.log('Audit was cancelled or restarted. Stopping.');
+          return;
+        }
+
+        if (new Date().getTime() - lastStatusUpdate > STATUS_UPDATE_INTERVAL_MS) {
+          updateAuditStatus('RUNNING', auditProgressMessage(auditState), auditState.filesProcessed, 0);
+          lastStatusUpdate = new Date().getTime();
+        }
+      }
+
+      // If still processing, schedule continuation
+      if (auditState.phase === 'PROCESSING') {
+        Logger.log('Out of time for this execution. Total files processed: ' + auditState.filesProcessed);
+        scheduleAuditContinuation(auditState);
+        return;
+      }
+    }
+
     // FINALIZING PHASE
     if (auditState.phase === 'FINALIZING') {
       Logger.log('Finalizing audit...');
+
+      // Formatting a very large sheet can be slow enough to get this
+      // execution killed, after which the watchdog retries. Each retry
+      // does less formatting so that finalizing always gets through.
+      auditState.finalizeAttempts = (auditState.finalizeAttempts || 0) + 1;
+      if (!saveAuditState(scriptProps, auditState)) {
+        Logger.log('Audit was cancelled or restarted. Stopping.');
+        return;
+      }
+
       updateAuditStatus('RUNNING', 'Finalizing audit...', auditState.filesProcessed, auditState.filesProcessed);
-      
+
       // Auto-resize columns and add filter
       auditSheet = ss.getSheetByName('Drive Audit');
-      const lastRow = auditSheet.getLastRow();
+      const lastRow = auditState.nextRow - 1;
 
       if (lastRow > 1) {
-        Logger.log('Auto-resizing columns...');
-        for (let i = 1; i <= 16; i++) {
-          auditSheet.autoResizeColumn(i);
+        if (auditState.finalizeAttempts === 1) {
+          Logger.log('Auto-resizing columns...');
+          auditSheet.autoResizeColumns(1, 16);
         }
 
-        Logger.log('Adding filter...');
-        auditSheet.getRange(1, 1, lastRow, 16).createFilter();
+        if (auditState.finalizeAttempts <= 2) {
+          Logger.log('Adding filter...');
+          const existingFilter = auditSheet.getFilter();
+          if (existingFilter) {
+            existingFilter.remove();
+          }
+          auditSheet.getRange(1, 1, lastRow, 16).createFilter();
+        }
       }
 
       // Free tier: results were truncated — add a prominent notice right
@@ -558,7 +693,7 @@ function processDriveAuditBatch() {
 
       if (showFreeLimitNotice) {
         Logger.log('Free tier: results truncated. Adding upgrade notice...');
-        const noticeRow = auditSheet.getLastRow() + 2;
+        const noticeRow = lastRow + 2;
         auditSheet.getRange(noticeRow, 1, 1, 16).merge();
         auditSheet.getRange(noticeRow, 1)
           .setValue('🔒 FREE TIER LIMIT: only the first ' + FREE_FILE_LIMIT + ' files are shown above. ' +
@@ -581,18 +716,18 @@ function processDriveAuditBatch() {
       } else {
         summarySheet = ss.insertSheet('Audit Summary', 0);
       }
-      
+
       createSummary(summarySheet, auditState.filesProcessed, auditState.auditDataCount, showFreeLimitNotice);
-      
+
       const endTime = new Date();
       const totalDuration = (new Date(endTime) - new Date(auditState.startTime)) / 1000;
-      
+
       Logger.log('=== AUDIT COMPLETED SUCCESSFULLY ===');
       Logger.log('End time: ' + endTime.toISOString());
       Logger.log('Total duration: ' + totalDuration + ' seconds');
       Logger.log('Files audited: ' + auditState.filesProcessed);
       Logger.log('Permission entries: ' + auditState.auditDataCount);
-      
+
       // Update the final status. A truncated free-tier run is reported as
       // FREE LIMIT HIT rather than COMPLETED — the Drive was NOT fully
       // audited, and the status should lead with how to unlock the rest.
@@ -612,62 +747,200 @@ function processDriveAuditBatch() {
           'Duration: ' + Math.round(totalDuration) + ' seconds',
           auditState.filesProcessed, auditState.filesProcessed);
       }
-      
-      // Clear audit state
-      scriptProps.deleteProperty('AUDIT_STATE');
-      scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
-      scriptProps.deleteProperty('AUDIT_SCOPE');
 
-      // Delete continuation triggers
-      deleteContinuationTriggers();
-      
+      // Clear audit state and stop the triggers
+      clearAuditState(scriptProps);
+      deleteAuditTriggers();
+
       Logger.log('Audit complete and state cleared');
     }
-      
+
   } catch (error) {
-    Logger.log('=== ERROR DURING AUDIT ===');
-    Logger.log('Error: ' + error.toString());
-    Logger.log('Stack trace: ' + error.stack);
-    
-    // Update status to ERROR
-    updateAuditStatus('ERROR', 'An error occurred during the audit: ' + error.toString(), 0, 0);
-    
-    // Clear state on error
-    scriptProps.deleteProperty('AUDIT_STATE');
-    scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
-    scriptProps.deleteProperty('AUDIT_SCOPE');
-    deleteContinuationTriggers();
+    handleAuditError(scriptProps, auditState, error);
   }
+}
+
+/**
+ * Handles an execution that failed. The audit keeps its progress and is
+ * retried from the last saved position; it only ends with an ERROR after
+ * MAX_CONSECUTIVE_ERRORS failed executions in a row.
+ */
+function handleAuditError(scriptProps, auditState, error) {
+  Logger.log('=== ERROR DURING AUDIT ===');
+  Logger.log('Error: ' + error.toString());
+  Logger.log('Stack trace: ' + error.stack);
+
+  // Retry from the progress that was actually saved: the in-memory state
+  // may be ahead of it.
+  let savedState = null;
+  try {
+    savedState = JSON.parse(scriptProps.getProperty('AUDIT_STATE'));
+  } catch (parseError) {
+    savedState = null;
+  }
+
+  if (savedState && auditState && savedState.runId !== auditState.runId) {
+    Logger.log('Audit was restarted. Leaving the new audit alone.');
+    return;
+  }
+
+  if (savedState && savedState.runId) {
+    savedState.consecutiveErrors = (savedState.consecutiveErrors || 0) + 1;
+
+    if (savedState.consecutiveErrors < MAX_CONSECUTIVE_ERRORS) {
+      scriptProps.setProperty('AUDIT_STATE', JSON.stringify(savedState));
+      if (!scheduleAuditContinuation(savedState)) {
+        return;
+      }
+      updateAuditStatus('RUNNING',
+        'A temporary problem interrupted the audit (attempt ' + savedState.consecutiveErrors +
+        ' of ' + MAX_CONSECUTIVE_ERRORS + '): ' + error.toString() + ' — ' +
+        'it will retry automatically in ' + CONTINUATION_DELAY_MINUTES + ' minute. ' +
+        savedState.filesProcessed + ' files processed so far.',
+        0, 0);
+      return;
+    }
+  }
+
+  // Update status to ERROR
+  updateAuditStatus('ERROR',
+    'The audit stopped because of an error: ' + error.toString() +
+    (savedState ? ' — the ' + savedState.filesProcessed + ' files processed before the error are still in the "Drive Audit" sheet.' : ''),
+    0, 0);
+
+  // Clear state on error
+  clearAuditState(scriptProps);
+  deleteAuditTriggers();
+}
+
+/**
+ * Saves the audit progress, unless the audit was cancelled or replaced by
+ * a new one while this execution was running.
+ *
+ * @return {boolean} false if this execution's audit is no longer current
+ */
+function saveAuditState(scriptProps, auditState) {
+  let current = null;
+  try {
+    current = JSON.parse(scriptProps.getProperty('AUDIT_STATE'));
+  } catch (error) {
+    current = null;
+  }
+
+  if (!current || current.runId !== auditState.runId) {
+    return false;
+  }
+
+  scriptProps.setProperty('AUDIT_STATE', JSON.stringify(auditState));
+  return true;
+}
+
+/**
+ * Deletes the saved audit progress.
+ */
+function clearAuditState(scriptProps) {
+  scriptProps.deleteProperty('AUDIT_STATE');
+  scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
+  scriptProps.deleteProperty('AUDIT_SCOPE');
+}
+
+/**
+ * Status message shown while the audit is running.
+ */
+function auditProgressMessage(auditState) {
+  return 'Audit in progress: ' + auditState.filesProcessed + ' files processed so far (' +
+    auditState.auditDataCount + ' rows). It continues automatically in the background, ' +
+    'so you can close this sheet. If "Last Updated" stops changing for more than 30 minutes, ' +
+    'Google\'s daily limit on background script time has probably been reached: the audit ' +
+    'picks up again by itself when the limit resets, within 24 hours. Starting a new audit ' +
+    'would discard the results so far.';
 }
 
 /**
  * Schedules the audit to continue
  * Uses 1-minute intervals for fast processing
+ *
+ * @return {boolean} false if nothing could be scheduled (audit is paused)
  */
-function scheduleAuditContinuation() {
+function scheduleAuditContinuation(auditState) {
   Logger.log('Scheduling audit continuation...');
-  
+
+  // Delete any existing continuation triggers
   try {
-    // Delete any existing continuation triggers
     deleteContinuationTriggers();
-    
-    // Use 1-minute intervals for fast continuation
-    const CONTINUATION_DELAY_MINUTES = 1;
-    
-    ScriptApp.newTrigger('processDriveAuditBatch')
-      .timeBased()
-      .after(CONTINUATION_DELAY_MINUTES * 60 * 1000)
-      .create();
-    
-    Logger.log('Audit continuation scheduled for ' + CONTINUATION_DELAY_MINUTES + ' minute from now');
-    updateAuditStatus('RUNNING', 
-      'Audit in progress. Will continue automatically in ' + CONTINUATION_DELAY_MINUTES + ' minute. ' +
-      'Check back later for results.',
-      0, 0);
-    
   } catch (error) {
-    Logger.log('Error scheduling continuation: ' + error.toString());
+    Logger.log('Error deleting continuation triggers: ' + error.toString());
   }
+
+  const continuationCreated = createAuditTrigger('processDriveAuditBatch', function(builder) {
+    return builder.after(CONTINUATION_DELAY_MINUTES * 60 * 1000);
+  });
+  const watchdogPresent = ensureWatchdogTrigger();
+
+  if (!continuationCreated && !watchdogPresent) {
+    // Nothing will wake the audit up again: say so instead of leaving a
+    // RUNNING status that never changes.
+    updateAuditStatus('PAUSED',
+      'The audit could not schedule its next step, so it is paused' +
+      (auditState ? ' at ' + auditState.filesProcessed + ' files' : '') + '. ' +
+      'Nothing is lost: choose Drive Audit > Resume Stalled Audit to continue.',
+      0, 0);
+    return false;
+  }
+
+  if (auditState) {
+    updateAuditStatus('RUNNING', auditProgressMessage(auditState), auditState.filesProcessed, 0);
+  }
+  return true;
+}
+
+/**
+ * Makes sure the recurring watchdog trigger exists. It restarts the audit
+ * whenever the chain of one-shot continuation triggers breaks.
+ *
+ * @return {boolean} whether the watchdog trigger is in place
+ */
+function ensureWatchdogTrigger() {
+  try {
+    const hasWatchdog = ScriptApp.getProjectTriggers().some(function(trigger) {
+      return trigger.getHandlerFunction() === 'auditWatchdog';
+    });
+    if (hasWatchdog) {
+      return true;
+    }
+  } catch (error) {
+    Logger.log('Error listing triggers: ' + error.toString());
+    return false;
+  }
+
+  return createAuditTrigger('auditWatchdog', function(builder) {
+    return builder.everyMinutes(WATCHDOG_INTERVAL_MINUTES);
+  });
+}
+
+/**
+ * Creates a time-based trigger, trying a few times: creating a trigger
+ * occasionally fails with a temporary server error.
+ *
+ * @param {string}   handler   - name of the function the trigger calls
+ * @param {Function} configure - sets the schedule on the trigger builder
+ * @return {boolean} whether the trigger was created
+ */
+function createAuditTrigger(handler, configure) {
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      configure(ScriptApp.newTrigger(handler).timeBased()).create();
+      return true;
+    } catch (error) {
+      Logger.log('Error creating ' + handler + ' trigger (attempt ' + attempt + '): ' + error.toString());
+      if (attempt < MAX_ATTEMPTS) {
+        Utilities.sleep(1000 * attempt);
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -683,7 +956,44 @@ function deleteContinuationTriggers() {
 }
 
 /**
- * Gets a batch of files from Google Drive
+ * Deletes every trigger that keeps an audit going: the continuation
+ * triggers and the watchdog. (The weekly schedule trigger is left alone.)
+ */
+function deleteAuditTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function(trigger) {
+    const handler = trigger.getHandlerFunction();
+    if (handler === 'processDriveAuditBatch' || handler === 'auditWatchdog') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+/**
+ * Calls a Drive API function, retrying with a growing delay when the
+ * failure is a temporary one (rate limit or server hiccup).
+ */
+function withRetry(apiCall) {
+  const MAX_ATTEMPTS = 4;
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return apiCall();
+    } catch (error) {
+      const message = String((error && error.message) || error);
+      const temporary = /rate limit|quota|backend error|internal error|server error|transient|timed? ?out|try again|unavailable|empty response/i.test(message);
+      if (!temporary || attempt >= MAX_ATTEMPTS) {
+        throw error;
+      }
+      Logger.log('Temporary Drive API error (attempt ' + attempt + '): ' + message);
+      Utilities.sleep(Math.pow(2, attempt) * 500 + Math.floor(Math.random() * 500));
+    }
+  }
+}
+
+/**
+ * Gets a batch of files from Google Drive. Throws if the Drive API keeps
+ * failing: a failed request must not be mistaken for the end of the list.
  *
  * @param {string} pageToken - Drive API page token (null for first page)
  * @param {number} pageSize  - files per page
@@ -693,50 +1003,171 @@ function getDriveFilesBatch(pageToken, pageSize, scope) {
   scope = scope || 'all';
   Logger.log('Fetching batch of files. Scope: ' + scope + ', PageToken: ' + (pageToken || 'null'));
 
-  try {
-    const params = {
-      pageSize: pageSize || 100,
-      fields: 'nextPageToken, files(id, name, mimeType, owners, createdTime, modifiedTime, size, webViewLink, permissions, parents)',
-      pageToken: pageToken
-    };
+  const params = {
+    pageSize: pageSize || 100,
+    fields: 'nextPageToken, files(id, name, mimeType, owners, createdTime, modifiedTime, size, webViewLink, parents, ' +
+      'permissions(id, type, role, emailAddress, domain, displayName))',
+    pageToken: pageToken
+  };
 
-    if (scope === 'all') {
-      // Original behavior: include shared/organizational drives
-      params.supportsAllDrives = true;
-      params.includeItemsFromAllDrives = true;
-    } else {
-      // 'myDrive' and 'owned': restrict to the user's own corpus, no shared drives
-      params.corpora = 'user';
-      params.supportsAllDrives = false;
-      params.includeItemsFromAllDrives = false;
-      if (scope === 'owned') {
-        params.q = "'me' in owners";
-      }
+  if (scope === 'all') {
+    // Original behavior: include shared/organizational drives
+    params.supportsAllDrives = true;
+    params.includeItemsFromAllDrives = true;
+  } else {
+    // 'myDrive' and 'owned': restrict to the user's own corpus, no shared drives
+    params.corpora = 'user';
+    params.supportsAllDrives = false;
+    params.includeItemsFromAllDrives = false;
+    if (scope === 'owned') {
+      params.q = "'me' in owners";
     }
-
-    const response = Drive.Files.list(params);
-
-    Logger.log('Retrieved ' + (response.files ? response.files.length : 0) + ' files');
-    return response;
-
-  } catch (error) {
-    Logger.log('ERROR fetching files batch: ' + error.toString());
-    Logger.log('Stack trace: ' + error.stack);
-    return null;
   }
+
+  const response = withRetry(function() {
+    return Drive.Files.list(params);
+  });
+
+  Logger.log('Retrieved ' + (response.files ? response.files.length : 0) + ' files');
+  return response;
+}
+
+/**
+ * Builds the sheet rows for one file (one row per permission) and appends
+ * them to auditData.
+ */
+function appendAuditRows(auditData, file, folderCache) {
+  // The file listing already carries the permissions of files the user can
+  // share. It leaves them out for shared drive items and files the user
+  // can't share, which need a request of their own.
+  const permissions = Array.isArray(file.permissions)
+    ? file.permissions
+    : getFilePermissions(file.id);
+  const folderPath = getFolderPath(file.parents, folderCache);
+
+  const fileColumns = [
+    file.name,
+    folderPath,
+    file.id,
+    file.owners && file.owners.length > 0 ? file.owners[0].emailAddress : 'Unknown',
+    getFileType(file),
+    file.mimeType,
+    file.createdTime ? new Date(file.createdTime) : '',
+    file.modifiedTime ? new Date(file.modifiedTime) : '',
+    file.size || '',
+    file.webViewLink || ''
+  ];
+
+  if (permissions.length === 0) {
+    auditData.push(fileColumns.concat([0, '', '', '', '', '']));
+    return;
+  }
+
+  permissions.forEach(function(permission) {
+    auditData.push(fileColumns.concat([
+      permissions.length,
+      permission.type,
+      permission.role,
+      permission.emailAddress || '',
+      permission.domain || '',
+      permission.displayName || ''
+    ]));
+  });
+}
+
+/**
+ * Loads the folders the user can see into folderCache with a few large
+ * requests, so resolving folder paths doesn't take a request per folder.
+ * Whatever it misses (or all of it, if it fails) is looked up one by one
+ * in lookupFolder.
+ *
+ * @param {Object} folderCache - folder id -> { name, parent }
+ * @param {string} scope       - 'all' | 'myDrive' | 'owned'
+ */
+function preloadFolders(folderCache, scope) {
+  const deadline = new Date().getTime() + FOLDER_PRELOAD_TIME_MS;
+  let pageToken = null;
+  let count = 0;
+
+  try {
+    do {
+      const params = {
+        q: "mimeType = 'application/vnd.google-apps.folder'",
+        pageSize: 1000,
+        fields: 'nextPageToken, files(id, name, parents)'
+      };
+      if (pageToken) {
+        params.pageToken = pageToken;
+      }
+      if (scope === 'all') {
+        params.supportsAllDrives = true;
+        params.includeItemsFromAllDrives = true;
+      } else {
+        // Files the user owns can sit in folders owned by someone else, so
+        // 'owned' loads the same folders as 'myDrive'.
+        params.corpora = 'user';
+      }
+
+      const response = withRetry(function() {
+        return Drive.Files.list(params);
+      });
+
+      (response.files || []).forEach(function(folder) {
+        folderCache[folder.id] = {
+          name: folder.name,
+          parent: (folder.parents && folder.parents.length > 0) ? folder.parents[0] : null
+        };
+        count++;
+      });
+
+      pageToken = response.nextPageToken;
+    } while (pageToken && new Date().getTime() < deadline);
+  } catch (error) {
+    Logger.log('WARNING: could not preload folders: ' + error.toString());
+  }
+
+  Logger.log('Preloaded ' + count + ' folders');
+}
+
+/**
+ * Looks up a folder's name and parent, fetching it from Drive if it isn't
+ * in folderCache yet. Returns null for a folder that can't be read.
+ */
+function lookupFolder(folderId, folderCache) {
+  if (Object.prototype.hasOwnProperty.call(folderCache, folderId)) {
+    return folderCache[folderId];
+  }
+
+  try {
+    const response = withRetry(function() {
+      return Drive.Files.get(folderId, {
+        fields: 'id, name, parents',
+        supportsAllDrives: true
+      });
+    });
+    folderCache[folderId] = {
+      name: response.name,
+      parent: (response.parents && response.parents.length > 0) ? response.parents[0] : null
+    };
+  } catch (error) {
+    Logger.log('WARNING: could not resolve folder ' + folderId + ': ' + error.toString());
+    folderCache[folderId] = null;
+  }
+
+  return folderCache[folderId];
 }
 
 /**
  * Resolves the full folder path for a file from its parent id(s),
  * e.g. "My Drive/Projects/2026/Reports".
  *
- * Walks up the parent chain, caching each folder lookup in folderCache
- * (keyed by folder id) so repeated ancestors aren't re-fetched. Returns
- * an empty string for files with no parent (e.g. items shared with you
- * that don't live in a folder you can traverse).
+ * Walks up the parent chain, looking each folder up through folderCache so
+ * repeated ancestors aren't re-fetched. Returns an empty string for files
+ * with no parent (e.g. items shared with you that don't live in a folder
+ * you can traverse).
  *
  * @param {string[]} parents     - file.parents from the Drive API
- * @param {Object}   folderCache - id -> folder resource (or null) cache
+ * @param {Object}   folderCache - folder id -> { name, parent } (or null) cache
  */
 function getFolderPath(parents, folderCache) {
   if (!parents || parents.length === 0) {
@@ -751,26 +1182,13 @@ function getFolderPath(parents, folderCache) {
   while (currentId && depth < MAX_DEPTH) {
     depth++;
 
-    let folder = folderCache[currentId];
-    if (folder === undefined) {
-      try {
-        folder = Drive.Files.get(currentId, {
-          fields: 'id, name, parents',
-          supportsAllDrives: true
-        });
-      } catch (error) {
-        Logger.log('WARNING: could not resolve folder ' + currentId + ': ' + error.toString());
-        folder = null;
-      }
-      folderCache[currentId] = folder;
-    }
-
+    const folder = lookupFolder(currentId, folderCache);
     if (!folder) {
       break;
     }
 
     pathParts.unshift(folder.name);
-    currentId = (folder.parents && folder.parents.length > 0) ? folder.parents[0] : null;
+    currentId = folder.parent;
   }
 
   return pathParts.join('/');
@@ -832,11 +1250,13 @@ function getFilePermissions(fileId) {
   const permissions = [];
   
   try {
-    const response = Drive.Permissions.list(fileId, {
-      fields: 'permissions(id, type, role, emailAddress, domain, displayName)',
-      supportsAllDrives: true
+    const response = withRetry(function() {
+      return Drive.Permissions.list(fileId, {
+        fields: 'permissions(id, type, role, emailAddress, domain, displayName)',
+        supportsAllDrives: true
+      });
     });
-    
+
     if (response.permissions) {
       return response.permissions;
     }
@@ -1106,13 +1526,11 @@ function cancelRunningAudit() {
   if (result === ui.Button.YES) {
     try {
       // Delete audit state
-      scriptProps.deleteProperty('AUDIT_STATE');
-      scriptProps.deleteProperty('AUDIT_PAGE_TOKEN');
-      scriptProps.deleteProperty('AUDIT_SCOPE');
+      clearAuditState(scriptProps);
 
-      // Delete continuation triggers
-      deleteContinuationTriggers();
-      Logger.log('Deleted continuation triggers');
+      // Delete the continuation and watchdog triggers
+      deleteAuditTriggers();
+      Logger.log('Deleted audit triggers');
       
       // Update status
       updateAuditStatus('CANCELLED', 
@@ -1170,6 +1588,8 @@ function showAuditStatus() {
       icon = '❌';
     } else if (status === 'CANCELLED') {
       icon = '🛑';
+    } else if (status === 'PAUSED') {
+      icon = '⏸️';
     } else if (status === 'FREE LIMIT HIT') {
       icon = '🔒';
     }
